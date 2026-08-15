@@ -1,0 +1,3 @@
+﻿zstandard>=0.22
+pycryptodome>=3.20
+
