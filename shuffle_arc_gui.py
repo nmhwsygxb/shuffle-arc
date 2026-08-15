@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-shuffle-arc 图形面板（单窗口三步流程）
-  第一步：浏览选择文件/目录 → 第二步：设置两个密码 → 第三步：进度条
-  完成后自动返回第一步。
-  要点：全程同一个窗口、同一个容器面板，切换步骤时“原地刷新”内容，
-  不新建窗口、不新建页面。
+shuffle-arc GUI panel (single-window, three-step flow)
+  Step 1: browse and select a file/directory → Step 2: set the two passwords → Step 3: progress bar
+  Returns to step 1 automatically when finished.
+  Key point: one window and one container panel throughout; switching steps refreshes the
+  content in place — no new windows, no new pages.
 """
 
 import os
@@ -38,12 +38,12 @@ def _log_crash():
 
 
 class TreePicker(tk.Toplevel):
-    """自绘选择器（替换全部原生对话框）：
-    mode="folder" → 只显示文件夹目录树，选文件夹；
-    mode="file"   → 目录+文件树，选文件（filetypes 过滤显示，如 [".far"]）。
-    懒加载 + 占位符：有子目录的节点必然出现“+”号，可逐级展开到任意深度。"""
+    """Self-drawn picker (replaces all native dialogs):
+    mode="folder" → shows a folder-only directory tree; picks a folder;
+    mode="file"   → shows a directory+file tree; picks a file (filetypes filter the display, e.g. [".far"]).
+    Lazy loading + placeholders: any node with subdirectories always shows a "+", expandable to any depth."""
 
-    def __init__(self, parent, title="选择", initial=None, mode="folder", filetypes=None):
+    def __init__(self, parent, title="Select", initial=None, mode="folder", filetypes=None):
         super().__init__(parent)
         self.title(title)
         self.geometry("620x500")
@@ -53,12 +53,12 @@ class TreePicker(tk.Toplevel):
         self.filetypes = filetypes or []
         self.show_all = tk.BooleanVar(value=False)
         self.selected = tk.StringVar()
-        self._ph = {}          # node_iid -> [占位符 iid 列表]
-        self._ph_seq = 0       # 占位符 iid 单调递增，永不复用
+        self._ph = {}          # node_iid -> [placeholder iid list]
+        self._ph_seq = 0       # placeholder iids increase monotonically and are never reused
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
-        ttk.Label(top, text="当前选择:").pack(side="left")
+        ttk.Label(top, text="Current selection:").pack(side="left")
         ttk.Entry(top, textvariable=self.selected).pack(side="left", fill="x", expand=True, padx=6)
 
         self.tree = ttk.Treeview(self, show="tree", selectmode="browse")
@@ -72,12 +72,12 @@ class TreePicker(tk.Toplevel):
         btns = ttk.Frame(self, padding=8)
         btns.pack(fill="x")
         if self.mode == "file" and self.filetypes:
-            ttk.Checkbutton(btns, text="显示所有文件", variable=self.show_all,
+            ttk.Checkbutton(btns, text="Show all files", variable=self.show_all,
                             command=self._refresh).pack(side="left")
-        ttk.Button(btns, text="新建文件夹", command=self._new_folder).pack(side="left", padx=6)
-        ttk.Button(btns, text="刷新", command=self._refresh).pack(side="left", padx=4)
-        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right", padx=4)
-        ttk.Button(btns, text="选择此文件夹" if mode == "folder" else "选择此文件",
+        ttk.Button(btns, text="New folder", command=self._new_folder).pack(side="left", padx=6)
+        ttk.Button(btns, text="Refresh", command=self._refresh).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="Choose this folder" if mode == "folder" else "Choose this file",
                    command=self._ok).pack(side="right")
 
         self._populate_drives()
@@ -85,7 +85,7 @@ class TreePicker(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
-    # ---------- 树操作 ----------
+    # ---------- tree operations ----------
     def _entry_ok(self, node, name):
         full = os.path.join(node, name)
         if self.mode == "file":
@@ -99,7 +99,7 @@ class TreePicker(tk.Toplevel):
         return "dir" if os.path.isdir(full) else None
 
     def _has_children(self, full):
-        """该目录是否有可展开的内容：子目录，或（文件模式下）可见文件。"""
+        """Whether the directory has expandable content: subdirectories, or (in file mode) visible files."""
         try:
             entries = os.listdir(full)
         except OSError:
@@ -113,7 +113,7 @@ class TreePicker(tk.Toplevel):
         return False
 
     def _fill(self, node):
-        """把 node 下的子目录（及文件）填入树；有可展开内容的节点补占位符以显示“+”。"""
+        """Fill the tree with node's subdirectories (and files); add a placeholder to nodes with expandable content so the "+" shows."""
         try:
             names = os.listdir(node)
         except OSError:
@@ -128,10 +128,10 @@ class TreePicker(tk.Toplevel):
             if full not in self._ph:
                 if self._has_children(full):
                     if self.tree.item(full, "open"):
-                        # 已展开的目录直接填真实内容，绝不留可见占位符
+                        # already-open directories get real content directly; never leave a visible placeholder
                         self._open_node(full)
                     else:
-                        # 占位符子节点让 Treeview 显示“+”（iid 单调递增，绝不复用）
+                        # a placeholder child makes Treeview show "+" (iids increase monotonically, never reused)
                         self._ph_seq += 1
                         ph = f"@ph{self._ph_seq}"
                         self.tree.insert(full, "end", iid=ph, text="")
@@ -142,7 +142,7 @@ class TreePicker(tk.Toplevel):
                 self.tree.insert(node, "end", iid=full, text=name, tags=("file",))
 
     def _open_node(self, node):
-        """展开节点：移除占位符并填入真实子内容（保证不留可见空行）。"""
+        """Expand a node: remove placeholders and fill in real children (ensures no visible blank rows remain)."""
         for ph in self._ph.pop(node, []):
             try:
                 self.tree.delete(ph)
@@ -173,7 +173,7 @@ class TreePicker(tk.Toplevel):
                 self.tree.item(node, open=True)
                 self._on_open(event)
         else:
-            # 文件：双击直接确认
+            # file: double-click confirms directly
             self._ok()
 
     def _populate_drives(self):
@@ -182,7 +182,7 @@ class TreePicker(tk.Toplevel):
                 self.tree.insert("", "end", iid=f"{d}:\\", text=f"{d}:\\")
 
     def _try_select(self, path):
-        """展开到 initial 路径并选中它（文件模式会定位到文件所在目录并选中文件）。"""
+        """Expand to the initial path and select it (in file mode, locates the file's directory and selects the file)."""
         if not path:
             return
         path = os.path.abspath(path)
@@ -217,7 +217,7 @@ class TreePicker(tk.Toplevel):
             self.tree.selection_set(path)
             self.tree.see(path)
 
-    # ---------- 辅助按钮 ----------
+    # ---------- helper buttons ----------
     def _refresh(self):
         for item in self.tree.get_children(""):
             self.tree.delete(item)
@@ -229,16 +229,16 @@ class TreePicker(tk.Toplevel):
         sel = self.tree.selection()
         base = sel[0] if sel else self.selected.get().strip()
         if not base or not os.path.isdir(base):
-            messagebox.showwarning("提示", "请先在上方选择一个文件夹作为新建位置", parent=self)
+            messagebox.showwarning("Notice", "Please select a folder above as the location for the new folder", parent=self)
             return
-        name = simpledialog.askstring("新建文件夹", "文件夹名称:", parent=self)
+        name = simpledialog.askstring("New folder", "Folder name:", parent=self)
         if not name:
             return
         path = os.path.join(base, name)
         try:
             os.makedirs(path)
         except OSError as e:
-            messagebox.showerror("出错", str(e), parent=self)
+            messagebox.showerror("Error", str(e), parent=self)
             return
         self._fill(base)
         self.tree.selection_set(path)
@@ -252,11 +252,11 @@ class TreePicker(tk.Toplevel):
             return
         if self.mode == "folder":
             if not os.path.isdir(chosen):
-                messagebox.showwarning("提示", "请选择一个文件夹", parent=self)
+                messagebox.showwarning("Notice", "Please choose a folder", parent=self)
                 return
         else:
             if not os.path.isfile(chosen):
-                messagebox.showwarning("提示", "请选择一个文件", parent=self)
+                messagebox.showwarning("Notice", "Please choose a file", parent=self)
                 return
         self.result = chosen
         self.destroy()
@@ -265,7 +265,7 @@ class TreePicker(tk.Toplevel):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("shuffle-arc 双密码加密压缩")
+        root.title("shuffle-arc dual-password encrypted archive")
         root.geometry("560x430")
         root.minsize(500, 400)
         root.resizable(True, True)
@@ -293,7 +293,7 @@ class App:
         self.show_step(1)
         self.root.after(120, self._poll)
 
-    # ---------------- 原地刷新面板（不新建页面） ----------------
+    # ---------------- in-place panel refresh (no new pages) ----------------
     def show_step(self, n):
         for w in self.container.winfo_children():
             w.destroy()
@@ -305,50 +305,50 @@ class App:
         elif n == 3:
             self._step3()
 
-    # ---------------- 第一步：浏览选择文件 ----------------
+    # ---------------- step 1: browse and select files ----------------
     def _step1(self):
-        ttk.Label(self.container, text="第一步：选择要处理的文件/目录",
+        ttk.Label(self.container, text="Step 1: select the file/directory to process",
                   font=("", 11, "bold")).pack(anchor="w", pady=(0, 8))
 
-        # 分组 1：操作模式
-        g1 = ttk.LabelFrame(self.container, text=" 操作模式 ", padding=8)
+        # group 1: operation mode
+        g1 = ttk.LabelFrame(self.container, text=" Operation mode ", padding=8)
         g1.pack(fill="x", pady=(0, 6))
         row = ttk.Frame(g1)
         row.pack(anchor="w")
-        ttk.Radiobutton(row, text="打包加密", variable=self.mode, value="pack",
+        ttk.Radiobutton(row, text="Pack & encrypt", variable=self.mode, value="pack",
                         command=self._on_mode).pack(side="left")
-        ttk.Radiobutton(row, text="解包解密", variable=self.mode, value="unpack",
+        ttk.Radiobutton(row, text="Unpack & decrypt", variable=self.mode, value="unpack",
                         command=self._on_mode).pack(side="left", padx=14)
-        ttk.Label(g1, text="（打包=文件/文件夹→.far 归档；解包=.far→还原）",
+        ttk.Label(g1, text="(pack = file/folder → .far archive; unpack = .far → restore)",
                   foreground="#7f8c8d").pack(anchor="w", pady=(4, 0))
 
         ttk.Separator(self.container).pack(fill="x", pady=8)
 
-        # 分组 2：源路径
-        g2 = ttk.LabelFrame(self.container, text=" 源文件/目录 ", padding=8)
+        # group 2: source path
+        g2 = ttk.LabelFrame(self.container, text=" Source file/directory ", padding=8)
         g2.pack(fill="x")
         row = ttk.Frame(g2)
         row.pack(fill="x")
         ttk.Entry(row, textvariable=self.src).pack(side="left", fill="x", expand=True)
-        self.btn_file = ttk.Button(row, text="选文件", command=self._browse_file)
-        self.btn_dir = ttk.Button(row, text="选文件夹", command=self._browse_dir)
+        self.btn_file = ttk.Button(row, text="Select file", command=self._browse_file)
+        self.btn_dir = ttk.Button(row, text="Select folder", command=self._browse_dir)
         self.btn_file.pack(side="left", padx=2)
         self.btn_dir.pack(side="left", padx=2)
         ttk.Label(g2,
-                  text="提示：点“选文件夹/浏览”打开目录树（只显示文件夹），单击选中后点“选择此文件夹”。",
+                  text="Tip: click \"Select folder / Browse\" to open the directory tree (folders only); click a folder, then click \"Choose this folder\".",
                   foreground="#7f8c8d", font=("", 9), wraplength=480).pack(anchor="w", pady=(4, 0))
 
         ttk.Separator(self.container).pack(fill="x", pady=8)
 
-        # 分组 3：输出路径
-        g3 = ttk.LabelFrame(self.container, text=" 输出路径 ", padding=8)
+        # group 3: output path
+        g3 = ttk.LabelFrame(self.container, text=" Output path ", padding=8)
         g3.pack(fill="x")
         row = ttk.Frame(g3)
         row.pack(fill="x")
         ttk.Entry(row, textvariable=self.out).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="浏览", command=self._browse_out).pack(side="left", padx=2)
+        ttk.Button(row, text="Browse", command=self._browse_out).pack(side="left", padx=2)
 
-        ttk.Button(self.container, text="下一步", command=self._step1_next).pack(anchor="e", pady=(14, 0))
+        ttk.Button(self.container, text="Next", command=self._step1_next).pack(anchor="e", pady=(14, 0))
         self._on_mode()
 
     def _on_mode(self):
@@ -357,18 +357,18 @@ class App:
         self.btn_file.pack_forget()
         self.btn_dir.pack_forget()
         if self.mode.get() == "pack":
-            self.btn_file.configure(text="选文件")
+            self.btn_file.configure(text="Select file")
             self.btn_file.pack(side="left", padx=2)
             self.btn_dir.pack(side="left", padx=2)
         else:
-            self.btn_file.configure(text="选 .far 归档")
+            self.btn_file.configure(text="Select .far archive")
             self.btn_file.pack(side="left", padx=2)
 
     def _browse_file(self):
         if self.mode.get() == "pack":
-            p = self._pick_file("选择要打包的文件")
+            p = self._pick_file("Select the file to pack")
         else:
-            p = self._pick_file("选择 .far 归档", filetypes=[".far"])
+            p = self._pick_file("Select the .far archive", filetypes=[".far"])
         if p:
             self.src.set(p)
             self._auto_out()
@@ -389,21 +389,21 @@ class App:
         return picker.result
 
     def _browse_dir(self):
-        p = self._pick_folder("选择要打包的文件夹", self.src.get().strip() or os.getcwd())
+        p = self._pick_folder("Select the folder to pack", self.src.get().strip() or os.getcwd())
         if p:
             self.src.set(p)
             self._auto_out()
 
     def _browse_out(self):
         if self.mode.get() == "pack":
-            p = self._pick_folder("选择归档保存的文件夹", os.path.dirname(self.out.get()) or os.getcwd())
+            p = self._pick_folder("Select the folder to save the archive", os.path.dirname(self.out.get()) or os.getcwd())
             if p:
                 base = os.path.basename(self.out.get()) or "backup.far"
                 if not base.lower().endswith(".far"):
                     base = os.path.splitext(base)[0] + ".far"
                 self.out.set(os.path.join(p, base))
         else:
-            p = self._pick_folder("选择解包输出目录", os.path.dirname(self.out.get()) or os.getcwd())
+            p = self._pick_folder("Select the unpack output directory", os.path.dirname(self.out.get()) or os.getcwd())
             if p:
                 self.out.set(p)
 
@@ -413,63 +413,63 @@ class App:
             return
         if self.mode.get() == "pack":
             if os.path.isdir(src):
-                # 目录名可能含点（如 my.data），不能 splitext
+                # directory names may contain dots (e.g. my.data); do not splitext
                 self.out.set(src + ".far")
             else:
                 self.out.set(os.path.splitext(src)[0] + ".far")
         else:
-            # 解包默认输出 = 归档所在目录（还原到归档旁边，不生成同名文件夹）
+            # unpack default output = the archive's directory (restore next to the archive, no same-named folder created)
             d = os.path.dirname(src)
             self.out.set(d if d else os.getcwd())
 
     def _step1_next(self):
         if not self.src.get().strip():
-            messagebox.showwarning("提示", "请先选择源文件/目录或 .far 归档")
+            messagebox.showwarning("Notice", "Please select a source file/directory or a .far archive first")
             return
         if not self.out.get().strip():
-            messagebox.showwarning("提示", "请填写输出路径")
+            messagebox.showwarning("Notice", "Please fill in the output path")
             return
         self.show_step(2)
 
-    # ---------------- 第二步：设置两个密码 ----------------
+    # ---------------- step 2: set the two passwords ----------------
     def _step2(self):
-        ttk.Label(self.container, text="第二步：设置两个独立密码",
+        ttk.Label(self.container, text="Step 2: set two independent passwords",
                   font=("", 11, "bold")).pack(anchor="w", pady=(0, 8))
 
-        # 分组 1：加密密码
-        g1 = ttk.LabelFrame(self.container, text=" 加密密码 ", padding=8)
+        # group 1: encryption password
+        g1 = ttk.LabelFrame(self.container, text=" Encryption password ", padding=8)
         g1.pack(fill="x")
         row = ttk.Frame(g1)
         row.pack(fill="x")
         ttk.Entry(row, textvariable=self.enc,
                   show="" if self.show_enc.get() else "•").pack(side="left", fill="x", expand=True)
-        ttk.Checkbutton(row, text="显示", variable=self.show_enc,
+        ttk.Checkbutton(row, text="Show", variable=self.show_enc,
                         command=self._refresh_step2).pack(side="left", padx=4)
-        ttk.Label(g1, text="保护文件内容（AES-256-GCM）", foreground="#7f8c8d").pack(anchor="w", pady=(4, 0))
+        ttk.Label(g1, text="Protects the file contents (AES-256-GCM)", foreground="#7f8c8d").pack(anchor="w", pady=(4, 0))
 
         ttk.Separator(self.container).pack(fill="x", pady=8)
 
-        # 分组 2：打乱密码
-        g2 = ttk.LabelFrame(self.container, text=" 打乱密码 ", padding=8)
+        # group 2: shuffle password
+        g2 = ttk.LabelFrame(self.container, text=" Shuffle password ", padding=8)
         g2.pack(fill="x")
         row = ttk.Frame(g2)
         row.pack(fill="x")
         ttk.Entry(row, textvariable=self.shuf,
                   show="" if self.show_shuf.get() else "•").pack(side="left", fill="x", expand=True)
-        ttk.Checkbutton(row, text="显示", variable=self.show_shuf,
+        ttk.Checkbutton(row, text="Show", variable=self.show_shuf,
                         command=self._refresh_step2).pack(side="left", padx=4)
-        ttk.Label(g2, text="保护块顺序（密钥化乱序，置换不入档）", foreground="#7f8c8d").pack(anchor="w", pady=(4, 0))
+        ttk.Label(g2, text="Protects the chunk order (keyed shuffling; the permutation is not stored in the archive)", foreground="#7f8c8d").pack(anchor="w", pady=(4, 0))
 
         ttk.Separator(self.container).pack(fill="x", pady=8)
 
         ttk.Label(self.container,
-                  text="⚠ 两个密码相互独立，忘记任何一个，数据将永久无法恢复！",
+                  text="⚠ The two passwords are independent; if you forget either one, the data will be permanently unrecoverable!",
                   foreground="#c0392b", wraplength=480).pack(anchor="w", pady=(4, 4))
 
         row = ttk.Frame(self.container)
         row.pack(anchor="e", pady=(10, 0))
-        ttk.Button(row, text="上一步", command=lambda: self.show_step(1)).pack(side="left", padx=4)
-        ttk.Button(row, text="下一步", command=self._step2_next).pack(side="left")
+        ttk.Button(row, text="Back", command=lambda: self.show_step(1)).pack(side="left", padx=4)
+        ttk.Button(row, text="Next", command=self._step2_next).pack(side="left")
 
     def _refresh_step2(self):
         if self.step == 2:
@@ -478,13 +478,13 @@ class App:
     def _step2_next(self):
         e, s = self.enc.get().strip(), self.shuf.get().strip()
         if not e or not s:
-            messagebox.showwarning("提示", "两个密码都不能为空")
+            messagebox.showwarning("Notice", "Both passwords are required")
             return
         if e == s:
-            messagebox.showwarning("提示", "两个密码必须不同且相互独立！")
+            messagebox.showwarning("Notice", "The two passwords must be different and mutually independent!")
             return
-        # 提前准备（后台）：打包→预读源；解包→预派生密钥+校验打乱密码
-        # 这样进入第三步时进度条直接开始走，不再卡在“准备中”
+        # prepare in advance (background): pack → pre-read the source; unpack → pre-derive keys + verify the shuffle password
+        # so the progress bar starts immediately on step 3 instead of hanging on "preparing"
         self._prep = None
         self._prep_error = None
         self._prep_params = dict(
@@ -512,14 +512,14 @@ class App:
             self.q.put(("prep_error", f"{type(e).__name__}: {e}"))
             _log_crash()
 
-    # ---------------- 第三步：进度条 ----------------
+    # ---------------- step 3: progress bar ----------------
     def _step3(self):
-        ttk.Label(self.container, text="第三步：处理中，请稍候…",
+        ttk.Label(self.container, text="Step 3: processing, please wait…",
                   font=("", 11, "bold")).pack(anchor="w", pady=(0, 12))
         self.pbar = ttk.Progressbar(self.container, mode="indeterminate")
         self.pbar.pack(fill="x", pady=8)
         self.pbar.start(20)
-        self.status = ttk.Label(self.container, text="正在准备…")
+        self.status = ttk.Label(self.container, text="Preparing…")
         self.status.pack(anchor="w", pady=4)
 
         self.busy = True
@@ -527,7 +527,7 @@ class App:
 
     def _start_worker_when_ready(self):
         if self._prep_error is not None:
-            return                      # 准备失败：_poll 已弹错并重置
+            return                      # preparation failed: _poll already showed the error and reset
         if self._prep is not None:
             t = threading.Thread(target=self._worker, args=(self._prep_params, self._prep), daemon=True)
             t.start()
@@ -541,7 +541,7 @@ class App:
                 output=params["out"],
                 enc_pass=params["enc"],
                 shuffle_pass=params["shuf"],
-                jobs=1,                 # GUI 内单进程执行，避免冻结 exe 的多进程问题
+                jobs=1,                 # single-process inside the GUI to avoid multiprocessing issues in a frozen exe
                 chunk=None,
             )
             if params["mode"] == "pack":
@@ -579,25 +579,25 @@ class App:
                 elif kind == "prep_error":
                     self._prep_error = payload
                     self.busy = False
-                    messagebox.showerror("出错", f"准备失败：\n{payload}")
+                    messagebox.showerror("Error", f"Preparation failed:\n{payload}")
                     self._reset()
                 elif kind == "done":
                     self.busy = False
-                    verb = "打包" if self.mode.get() == "pack" else "解包"
+                    verb = "Pack" if self.mode.get() == "pack" else "Unpack"
                     shown = payload if payload else self.out.get()
-                    messagebox.showinfo("完成", f"{verb}完成！\n结果已保存到：\n{shown}")
+                    messagebox.showinfo("Done", f"{verb} complete!\nResult saved to:\n{shown}")
                     self._reset()
                 elif kind == "error":
                     self.busy = False
-                    verb = "打包" if self.mode.get() == "pack" else "解包"
-                    messagebox.showerror("出错", f"{verb}失败：\n{payload}")
+                    verb = "Pack" if self.mode.get() == "pack" else "Unpack"
+                    messagebox.showerror("Error", f"{verb} failed:\n{payload}")
                     self._reset()
         except queue.Empty:
             pass
         self.root.after(120, self._poll)
 
     def _reset(self):
-        # 完成/出错后返回第一步，清空所有输入与准备状态
+        # after finishing/erroring, return to step 1 and clear all inputs and preparation state
         self.src.set("")
         self.out.set("")
         self.enc.set("")
@@ -626,7 +626,7 @@ if __name__ == "__main__":
     except Exception:
         _log_crash()
         try:
-            messagebox.showerror("shuffle-arc", "程序启动失败，详情见 shuffle-arc-error.log")
+            messagebox.showerror("shuffle-arc", "Startup failed; see shuffle-arc-error.log for details")
         except Exception:
             pass
         raise
