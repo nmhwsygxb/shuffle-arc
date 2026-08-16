@@ -446,7 +446,7 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
         progress(done, total, "解密解压")
     try:
         if args.jobs > 1:
-            with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key,)) as pool:
+            with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key, ZSTD_LEVEL)) as pool:
                 work = [(s, entries[s], _read_payload_of(args.input, entries[s])) for s in range(n)]
                 for slot, plain in pool.imap_unordered(unpack_chunk, work):
                     blocks[perm[slot]] = plain
@@ -596,7 +596,7 @@ def _unpack_v1(args, meta, enc_key, shuf_key, progress):
     data_slots = [s for s in range(n) if s != slot0]
     try:
         if args.jobs > 1:
-            with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key,)) as pool:
+            with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key, ZSTD_LEVEL)) as pool:
                 work = [(s, entries[s], _read_payload_of(args.input, entries[s])) for s in data_slots]
                 for r in pool.imap_unordered(unpack_chunk, work):
                     _place_data(*r)
