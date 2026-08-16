@@ -42,6 +42,13 @@
 
 ## 安装 / 运行
 
+### 语言版本（中英共存）
+
+- **英文版**：`shuffle_arc.py` / `shuffle_arc_gui.py`（英文注释与输出）、`shuffle-arc-gui.exe`、`shuffle-arc-cli.exe`
+- **中文版**：`shuffle_arc_zh.py` / `shuffle_arc_gui_zh.py`（中文注释与输出）、`shuffle-arc-gui-zh.exe`、`shuffle-arc-cli-zh.exe`
+
+功能完全一致，按语言喜好选用。
+
 ### 免安装 exe（Windows）
 
 - **`shuffle-arc.exe`**（GUI 面板，双击使用，3 步流程：选文件 → 设双密码 → 进度条）
