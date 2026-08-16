@@ -28,7 +28,14 @@ It is not a 7z replacement. It is for the case where you want the *layout of the
 
 ## Install
 
-**Windows exe (no install):** grab `shuffle-arc-gui.exe` (GUI) or `shuffle-arc-cli.exe` (CLI) from the [Releases](https://github.com/nmhwsygxb/shuffle-arc/releases) page.
+### Language versions (CN + EN coexist)
+
+- **English:** `shuffle_arc.py` / `shuffle_arc_gui.py` (English comments & output), `shuffle-arc-gui.exe`, `shuffle-arc-cli.exe`
+- **中文版:** `shuffle_arc_zh.py` / `shuffle_arc_gui_zh.py` (Chinese comments & output), `shuffle-arc-gui-zh.exe`, `shuffle-arc-cli-zh.exe`
+
+Identical features; pick whichever language you prefer.
+
+**Windows exe (no install):** grab the GUI or CLI exe from the [Releases](https://github.com/nmhwsygxb/shuffle-arc/releases) page.
 
 **From source (Python 3.9+):**
 
