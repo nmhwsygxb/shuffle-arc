@@ -17,7 +17,7 @@ import types
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
 
-import shuffle_arc as core
+import shuffle_arc_zh as core
 
 
 def _log_path():
@@ -266,9 +266,10 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("shuffle-arc 双密码加密压缩")
-        root.geometry("560x430")
-        root.minsize(500, 400)
+        root.geometry("560x480")
+        root.minsize(500, 440)
         root.resizable(True, True)
+        self._setup_style()
 
         self.q = queue.Queue()
         self.step = 0
@@ -292,6 +293,36 @@ class App:
         self.container.pack(fill="both", expand=True)
         self.show_step(1)
         self.root.after(120, self._poll)
+
+    def _setup_style(self):
+        style = ttk.Style()
+        available = style.theme_names()
+        if "clam" in available:
+            style.theme_use("clam")
+        PRIMARY = "#1565C0"
+        PRIMARY_LIGHT = "#5E92F3"
+        SECONDARY = "#00897B"
+        SURFACE = "#F5F5F5"
+        ON_SURFACE = "#1C1B1F"
+        OUTLINE = "#BDBDBD"
+        style.configure("TLabel", background=SURFACE, foreground=ON_SURFACE, font=("Microsoft YaHei", 10))
+        style.configure("TFrame", background=SURFACE)
+        style.configure("TButton", background=PRIMARY, foreground="white", font=("Microsoft YaHei", 10, "bold"),
+                        borderwidth=0, focusthickness=3, focuscolor=PRIMARY_LIGHT)
+        style.map("TButton", background=[("active", PRIMARY_LIGHT), ("pressed", "#0D47A1")])
+        style.configure("TEntry", fieldbackground="white", foreground=ON_SURFACE, borderwidth=1,
+                        font=("Microsoft YaHei", 10))
+        style.configure("TLabelframe", background=SURFACE, foreground=PRIMARY, font=("Microsoft YaHei", 10, "bold"))
+        style.configure("TLabelframe.Label", background=SURFACE, foreground=PRIMARY, font=("Microsoft YaHei", 10, "bold"))
+        style.configure("TRadiobutton", background=SURFACE, foreground=ON_SURFACE, font=("Microsoft YaHei", 10))
+        style.configure("TCheckbutton", background=SURFACE, foreground=ON_SURFACE, font=("Microsoft YaHei", 10))
+        style.configure("TSeparator", background=OUTLINE)
+        style.configure("Treeview", background="white", foreground=ON_SURFACE, fieldbackground="white",
+                        font=("Microsoft YaHei", 10))
+        style.configure("Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
+        style.configure("TProgressbar", background=SECONDARY, troughcolor=OUTLINE, bordercolor=OUTLINE,
+                        lightcolor=SECONDARY, darkcolor=SECONDARY)
+        self.root.configure(bg=SURFACE)
 
     # ---------------- 原地刷新面板（不新建页面） ----------------
     def show_step(self, n):

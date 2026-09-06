@@ -20,7 +20,12 @@ v3 变更（2026-08-16）：
   * 分块去重：所有文件按固定大小切块，内容相同的块只存一份；
     相似文件只存差异块，相同部分不重复存储（明文清单记录每文件的块引用）。
   * 加密区只含「唯一块」；置换也只对唯一块做。
-  * 仍可解 v1 旧档（旧档清单加密于第 0 块）。
+
+v4 流式解包（2026-08-28）：
+  * 解包改为全流式：唯一块按需解密、边解边写文件，解密结果经由有上限的
+    LRU 块缓存流转（默认 256 MiB 封顶），不再把全部明文块留在内存，
+    任意大小的归档解包峰值内存都有界。
+  * 已彻底移除 v1 旧档支持（LEGACY_V1 相关代码路径全部删除）。
 
 特性：
   * 置换完全由打乱密码决定，文件头不含置换表 —— 即使拿到归档+加密密码，
@@ -33,7 +38,7 @@ v3 变更（2026-08-16）：
     “弱加密 + 打乱”并不能防暴力破解 —— 请使用强随机密码。
   * v3 明文清单会泄露文件名、大小与块数（用户已知并接受）。
   * 忘记任意一个密码 = 数据永久不可恢复。
-  * 自定义格式，无跨版本兼容承诺（v3 可解 v1）。
+  * 自定义格式，无跨版本兼容承诺（仅 v3）。
 
 用法：
   pack   : python shuffle-arc.py pack  -i <文件或目录> -o out.far -e 密码A -s 密码B [-c 1048576] [-I 300000] [-j 4]
@@ -60,7 +65,6 @@ from Crypto.Random import get_random_bytes
 
 MAGIC = b"SFAR1"
 VERSION = 3
-LEGACY_V1 = 1
 SALT_LEN = 16
 NONCE_LEN = 12
 TAG_LEN = 16
@@ -68,6 +72,7 @@ KEY_LEN = 32
 DEFAULT_CHUNK = 4 << 20      # 4 MiB（去重粒度 = 加密块大小；基准：4MB 块比 1MB 快 ~29%）
 DEFAULT_ITER = 300_000       # PBKDF2 迭代次数
 ZSTD_LEVEL = 1               # zstd 压缩级别（基准：level1 比 level3 快 ~45%，压缩比几乎无损；可经 -z 覆盖）
+STREAM_CACHE_BYTES = 256 << 20   # v4 流式解包：解密明文块的 LRU 缓存上限（256 MiB）
 
 HEADER_FMT = ">5sBQIIQQ16s16s32sQ"   # magic, ver, chunk_size, n, iter, manifest_len, orig_len, salt1, salt2, perm_check, table_offset
 HEADER_LEN = struct.calcsize(HEADER_FMT)
@@ -208,28 +213,39 @@ def build_blocks(in_path: str, chunk_size: int) -> tuple:
 def parse_manifest_v3(manifest: bytes) -> list:
     """返回 [(relpath, size, refs), ...]（v3 明文清单）。"""
     out = []
-    for line in manifest.decode("utf-8").splitlines():
+    try:
+        text = manifest.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("归档清单损坏（编码错误），归档可能被篡改！") from None
+    for line in text.splitlines():
         if not line:
             continue
         try:
             size_s, rest = line.split("\t", 1)
             rel, _, refs_s = rest.partition("\t")
+            size = int(size_s)
+            if size < 0:
+                raise ValueError
             refs = [int(x) for x in refs_s.split(",") if x] if refs_s else []
-            out.append((rel, int(size_s), refs))
+            out.append((rel, size, refs))
         except (ValueError, IndexError):
             raise ValueError("归档清单损坏（格式错误），归档可能被篡改！") from None
     return out
 
 
-def parse_manifest_v1(manifest: bytes) -> list:
-    """返回 [(relpath, length), ...]（v1 清单，仅两列）。"""
-    out = []
-    for line in manifest.decode("utf-8").splitlines():
-        if not line:
-            continue
-        length_s, _, name = line.partition("\t")
-        out.append((name, int(length_s)))
-    return out
+def _validate_relpath(relpath: str) -> str:
+    """安全：拒绝归档清单中的路径穿越 / 绝对路径 / Windows 危险路径。
+    v3 清单是明文，攻击者可构造恶意条目；解包绝不能写到输出目录之外。
+    返回规范化后的 relpath（正斜杠，无空/'.'/'..' 段）。"""
+    if not relpath:
+        sys.exit("归档清单中的不安全路径：空 relpath")
+    if relpath.startswith(("/", "\\")) or len(relpath) >= 2 and relpath[1] == ":":
+        sys.exit(f"归档清单中的绝对路径不安全：{relpath!r}")
+    norm = relpath.replace("\\", "/")
+    parts = norm.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        sys.exit(f"归档清单中的路径穿越不安全：{relpath!r}")
+    return norm
 
 
 def unique_path(path: Path) -> Path:
@@ -342,13 +358,29 @@ def pack(args, progress=None, prebuilt=None):
 
 def read_archive_meta(path: str):
     with open(path, "rb") as f:
+        f.seek(0, 2)
+        file_size = f.tell()
+        if file_size < HEADER_LEN:
+            sys.exit("不是 shuffle-arc 归档文件（文件过小）")
+        f.seek(0)
         hdr = f.read(HEADER_LEN)
     magic, ver, chunk_size, n, iterations, manifest_len, orig_len, salt1, salt2, perm_check, table_offset = \
         struct.unpack(HEADER_FMT, hdr)
     if magic != MAGIC:
         sys.exit("不是 shuffle-arc 归档文件（magic 不匹配）")
-    if ver not in (LEGACY_V1, VERSION):
-        sys.exit(f"不支持的版本: {ver}")
+    if ver != VERSION:
+        sys.exit(f"不支持的版本: {ver}（仅支持 v3 归档）")
+    # 对攻击者可控的头字段做合理性限制（恶意归档 → DoS / 荒谬分配）
+    if n <= 0 or n > 50_000_000:
+        sys.exit(f"归档头中的块数不合理: {n}")
+    if iterations < 1000 or iterations > 50_000_000:
+        sys.exit(f"归档头中的 PBKDF2 迭代次数不合理: {iterations}")
+    if chunk_size <= 0 or chunk_size > (1 << 34):          # 16 GiB 上限
+        sys.exit(f"归档头中的块大小不合理: {chunk_size}")
+    if not (0 <= manifest_len <= file_size - HEADER_LEN) or orig_len > (1 << 46):  # 声明的总量上限 64 TiB
+        sys.exit("归档头与文件大小不一致，已中止")
+    if not (HEADER_LEN + manifest_len <= table_offset <= file_size):
+        sys.exit("归档头条目表偏移越界，已中止")
     return dict(version=ver, chunk_size=chunk_size, n=n, iterations=iterations,
                 manifest_len=manifest_len, orig_len=orig_len,
                 salt1=salt1, salt2=salt2, perm_check=perm_check,
@@ -357,14 +389,25 @@ def read_archive_meta(path: str):
 
 def read_entries(path: str, n: int, table_offset: int) -> list:
     with open(path, "rb") as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        need = n * ENTRY_LEN
+        if table_offset + need > fsize:
+            sys.exit("归档条目表不完整 — 归档已损坏或遭篡改！")
         f.seek(table_offset)
-        raw = f.read(n * ENTRY_LEN)
+        raw = f.read(need)
     return [struct.unpack(ENTRY_FMT, raw[i:i + ENTRY_LEN]) for i in range(0, len(raw), ENTRY_LEN)]
 
 
 def _read_payload_of(path: str, entry):
     nonce, clen, olen, off = entry
+    if clen <= 0 or off < 0:
+        sys.exit("归档条目含无效的载荷偏移/长度 — 归档已损坏！")
     with open(path, "rb") as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        if off + clen > fsize:
+            sys.exit("归档条目指向文件末尾之外 — 归档已损坏！")
         f.seek(off)
         return f.read(clen)
 
@@ -382,13 +425,113 @@ def unpack(args, progress=None, precomputed=None):
     if not hmac.compare_digest(hmac.new(shuf_key, PERM_CHECK_LABEL, hashlib.sha256).digest(),
                                meta["perm_check"]):
         sys.exit("打乱密码错误，或归档已损坏！")
-    if meta["version"] == LEGACY_V1:
-        return _unpack_v1(args, meta, enc_key, shuf_key, progress)
     return _unpack_v3(args, meta, enc_key, shuf_key, progress)
 
 
+def _open_output_targets(files, out_arg):
+    """解析输出布局、创建目录，返回 (targets, first_display, dir_mode)。
+    files: [(relpath, size, refs)]。targets：每个文件一个已打开的可写句柄。
+    安全：每个 relpath 都经校验（拒绝路径穿越/绝对路径），即使面对恶意构造的
+    归档，解包也绝不能写到输出目录之外。"""
+    dir_mode = any("/" in rel for rel, _, _ in files) or len(files) > 1
+    targets = []
+    first_display = None
+    safe_files = []
+    for relpath, size, refs in files:
+        safe_files.append((_validate_relpath(relpath), size, refs))
+    files = safe_files
+    if dir_mode:
+        out_dir = Path(out_arg)
+        if out_dir.exists() and not out_dir.is_dir():
+            sys.exit(f"输出路径 {out_arg} 已存在且不是目录！")
+        top0 = files[0][0].split("/", 1)[0] if "/" in files[0][0] else files[0][0]
+        if out_dir.exists() and out_dir.name == top0:
+            out_dir = unique_path(out_dir)
+        out_dir = out_dir.resolve()          # 规范化基准；所有目标都必须在其下
+        out_dir.mkdir(parents=True, exist_ok=True)
+        roots = {}
+        for relpath, size, refs in files:
+            if "/" in relpath:
+                top, rel = relpath.split("/", 1)
+            else:
+                top, rel = relpath, ""
+            if top not in roots:
+                root = unique_path(out_dir / top)
+                root.mkdir(parents=True, exist_ok=True)
+                roots[top] = root
+                if first_display is None:
+                    first_display = root
+            target = unique_path(roots[top] / rel) if rel else roots[top]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # 纵深防御：拒绝任何逃逸出输出根目录的路径（符号链接/竞态）
+            if not (target.resolve().is_relative_to(out_dir.resolve())):
+                sys.exit(f"输出路径解析到 {out_dir} 之外，不安全: {target}")
+            targets.append(open(target, "wb"))          # 流式：句柄保持打开，由调用方关闭
+    else:
+        relpath, size, refs = files[0]
+        if os.path.isdir(out_arg) or out_arg.endswith(("/", "\\")):
+            out_dir = Path(out_arg).resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            target = unique_path(out_dir / relpath)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not (target.resolve().is_relative_to(out_dir)):
+                sys.exit(f"输出路径解析到 {out_dir} 之外，不安全: {target}")
+        else:
+            Path(out_arg).parent.mkdir(parents=True, exist_ok=True)
+            target = unique_path(Path(out_arg))
+        targets.append(open(target, "wb"))
+        first_display = target
+    return targets, first_display, dir_mode
+
+
+class _LRUCache:
+    """有上限内存的明文块 LRU 缓存，按「原始块下标」为键。
+    字节预算约束：插入新块后逐出最久未用的条目，直到放得下为止。"""
+
+    def __init__(self, budget):
+        self.budget = budget
+        self._data = {}          # ref -> bytes
+        self._order = []         # 近期使用顺序（末尾 = 最近）
+        self._bytes = 0
+
+    def get(self, ref):
+        if ref not in self._data:
+            return None
+        self._order.remove(ref)
+        self._order.append(ref)
+        return self._data[ref]
+
+    def put(self, ref, chunk):
+        if ref in self._data:
+            self._order.remove(ref)
+            self._bytes -= len(self._data[ref])
+        self._data[ref] = chunk
+        self._order.append(ref)
+        self._bytes += len(chunk)
+        while self._bytes > self.budget and len(self._data) > 1:
+            old = self._order.pop(0)
+            if old in self._data:
+                self._bytes -= len(self._data.pop(old))
+
+    def __len__(self):
+        return len(self._data)
+
+
+def _decrypt_slot_entry(path, entry, slot):
+    """从归档读取一个槽位的密文并解密+解压，返回明文。"""
+    try:
+        _, plain = unpack_chunk((slot, entry, _read_payload_of(path, entry)))
+        return plain
+    except AuthError:
+        sys.exit("解密失败：加密密码错误，或归档已损坏！")
+    except zstd.ZstdError:
+        sys.exit("解压失败：归档已损坏！")
+
+
 def _unpack_v3(args, meta, enc_key, shuf_key, progress):
-    """v3：明文清单 + 唯一块池 + 按引用重组。"""
+    """v3：明文清单 + 唯一块池 + 按引用重组。
+    v4：全流式 — 解密块经由有上限的 LRU 缓存流转，写文件时逐块写出，
+    任意大小的归档解包峰值内存都有界。"""
     n = meta["n"]                       # 唯一块数
     manifest_len = meta["manifest_len"]
     with open(args.input, "rb") as f:
@@ -401,6 +544,11 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
     if not files:
         print("unpack 完成: 归档为空（无文件）")
         return str(args.output)
+    # 安全：拒绝恶意清单中越界的块引用（会导致崩溃/错乱重组）
+    for relpath, size, refs in files:
+        bad = [r for r in refs if not (0 <= r < n)]
+        if bad:
+            sys.exit(f"归档清单引用了不存在的块 {bad[:8]} — 已损坏或遭篡改！")
     dir_mode = any("/" in rel for rel, _, _ in files) or len(files) > 1
     tail_steps = len(files) if dir_mode else 1
     total = 1 + n + tail_steps
@@ -411,15 +559,7 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
     perm = make_perm(n, shuf_key)
     inv = [0] * n
     for s, p in enumerate(perm):
-        inv[p] = s
-
-    def _decrypt(slot):
-        try:
-            return unpack_chunk((slot, entries[slot], _read_payload_of(args.input, entries[slot])))
-        except AuthError:
-            sys.exit("解密失败：加密密码错误，或归档已损坏！")
-        except zstd.ZstdError:
-            sys.exit("解压失败：归档已损坏！")
+        inv[p] = s                      # 原始下标 -> 存储槽位
 
     if args.chunk is not None:
         # 随机访问：唯一块池中原始第 N 块
@@ -427,25 +567,38 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
         if not (0 <= orig_idx < n):
             sys.exit(f"--chunk {args.chunk} 越界（唯一块数 {n}）")
         slot = inv[orig_idx]
-        try:
-            _, plain = unpack_chunk((slot, entries[slot], _read_payload_of(args.input, entries[slot])))
-        except AuthError:
-            sys.exit("解密失败：加密密码错误，或归档已损坏！")
-        except zstd.ZstdError:
-            sys.exit("解压失败：归档已损坏！")
+        plain = _decrypt_slot_entry(args.input, entries[slot], slot)
         out_path = f"{args.output}.chunk{args.chunk}"
         with open(out_path, "wb") as f:
             f.write(plain)
         print(f"随机访问: 唯一块 #{args.chunk}（{len(plain)} B）已解出 → {out_path}")
         return str(out_path)
 
-    # 解密唯一块池
-    blocks = [None] * n
+    # 策略选择：全部唯一块明文总量在流式预算内且请求了并行时，
+    # 一次性并行解密整个块池（旧的快路径）；否则流式：按需经 LRU 缓存解密
+    #（内存有界，任意大小都可用）。
+    total_plain = sum(e[2] for e in entries)          # 每个唯一块的 orig_len
+    use_parallel = args.jobs > 1 and total_plain <= STREAM_CACHE_BYTES
+
     done = 1
     if progress:
         progress(done, total, "解密解压")
-    try:
-        if args.jobs > 1:
+
+    cache = _LRUCache(STREAM_CACHE_BYTES)
+
+    def _block_of(ref):
+        """原始块 `ref` 的明文（来自并行池或 LRU 缓存）。"""
+        b = cache.get(ref)
+        if b is not None:
+            return b
+        slot = inv[ref]
+        b = _decrypt_slot_entry(args.input, entries[slot], slot)
+        cache.put(ref, b)
+        return b
+
+    if use_parallel:
+        blocks = {}
+        try:
             with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key, ZSTD_LEVEL)) as pool:
                 work = [(s, entries[s], _read_payload_of(args.input, entries[s])) for s in range(n)]
                 for slot, plain in pool.imap_unordered(unpack_chunk, work):
@@ -453,215 +606,38 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
                     done += 1
                     if progress:
                         progress(done, total, "解密解压")
-        else:
-            for s in range(n):                     # 单进程：逐块懒读取
-                blocks[perm[s]] = _decrypt(s)[1]
+        except AuthError:
+            sys.exit("解密失败：加密密码错误，或归档已损坏！")
+
+        def _block_of(ref):
+            return blocks[ref]
+
+    # 流式：逐个文件、逐块经 LRU 缓存写出
+    targets, first_display, dir_mode = _open_output_targets(files, args.output)
+    try:
+        for (relpath, size, refs), fh in zip(files, targets):
+            for r in refs:
+                fh.write(_block_of(r))
+            fh.flush()
+            if not use_parallel:
                 done += 1
                 if progress:
-                    progress(done, total, "解密解压")
-    except AuthError:
-        sys.exit("解密失败：加密密码错误，或归档已损坏！")
+                    progress(done, total, "写入文件")
+    finally:
+        for fh in targets:
+            fh.close()
 
-    # 按引用重组并写文件
-    def _compose(refs):
-        parts = []
-        for r in refs:
-            b = blocks[r]
-            if b is None:
-                sys.exit("归档损坏：块引用指向不存在的唯一块！")
-            parts.append(b)
-        return b"".join(parts)
-
-    if dir_mode:
-        out_dir = Path(args.output)
-        if out_dir.exists() and not out_dir.is_dir():
-            sys.exit(f"输出路径 {args.output} 已存在且不是目录！")
-        top0 = files[0][0].split("/", 1)[0] if "/" in files[0][0] else files[0][0]
-        if out_dir.exists() and out_dir.name == top0:
-            out_dir = unique_path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        roots = {}          # 顶层文件夹 → 唯一目标目录
-        first_root = None
-        for relpath, size, refs in files:
-            if "/" in relpath:
-                top, rel = relpath.split("/", 1)
-            else:
-                top, rel = relpath, ""
-            if top not in roots:
-                root = unique_path(out_dir / top)
-                root.mkdir(parents=True, exist_ok=True)
-                roots[top] = root
-                if first_root is None:
-                    first_root = root
-            target = unique_path(roots[top] / rel) if rel else roots[top]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(_compose(refs))
-            done += 1
-            if progress:
-                progress(done, total, "写入文件")
-        print(f"unpack 完成: {len(files)} 个文件 → {first_root}/")
-        return str(first_root)
-    else:
-        # 单文件归档：输出为文件路径；若输出是目录则写入其中
-        relpath, size, refs = files[0]
-        if os.path.isdir(args.output) or args.output.endswith(("/", "\\")):
-            out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            target = unique_path(out_dir / relpath)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(_compose(refs))
-            done += 1
-            if progress:
-                progress(done, total, "写入文件")
-            print(f"unpack 完成: 1 个文件 → {target}（{size} B）")
-            return str(target)
-        else:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            target = unique_path(Path(args.output))
-            target.write_bytes(_compose(refs))
-            done += 1
-            if progress:
-                progress(done, total, "写入文件")
-            print(f"unpack 完成: 1 个文件 → {target}（{size} B）")
-            return str(target)
-
-
-def _unpack_v1(args, meta, enc_key, shuf_key, progress):
-    """v1 旧档：manifest 是加密的第 0 块，数据块从 1 开始。"""
-    n = meta["n"]
-    cs = meta["chunk_size"]
-    manifest_len = meta["manifest_len"]
-    entries = read_entries(args.input, n, meta["table_offset"])
-    global KEY
-    KEY = enc_key   # --chunk 分支在主进程直接解密；全量分支由 worker initializer 注入
-    perm = make_perm(n, shuf_key)
-    inv = [0] * n
-    for s, p in enumerate(perm):
-        inv[p] = s
-
-    if args.chunk is not None:
-        # 第 0 块是 manifest；--chunk i 对应数据块 i（原始下标 i+1）
-        orig_idx = args.chunk + 1
-        if not (0 <= orig_idx < n):
-            sys.exit(f"--chunk {args.chunk} 越界（数据块数 {n - 1}）")
-        slot = inv[orig_idx]
-        payload = _read_payload_of(args.input, entries[slot])
-        try:
-            slot_back, plain = unpack_chunk((slot, entries[slot], payload))
-        except AuthError:
-            sys.exit("解密失败：加密密码错误，或归档已损坏！")
-        out_path = f"{args.output}.chunk{args.chunk}"
-        with open(out_path, "wb") as f:
-            f.write(plain)
-        print(f"随机访问: 原始第 {args.chunk} 块（{len(plain)} B）已解出 → {out_path}")
-        return str(out_path)
-
-    def _decrypt(slot):
-        try:
-            return unpack_chunk((slot, entries[slot], _read_payload_of(args.input, entries[slot])))
-        except AuthError:
-            sys.exit("解密失败：加密密码错误，或归档已损坏！")
-        except zstd.ZstdError:
-            sys.exit("解压失败：归档已损坏！")
-
-    # 第 1 步：解密 manifest（第 0 块），确定文件数与总进度步数
-    slot0 = inv[0]
-    _, manifest_bytes = _decrypt(slot0)
-    if len(manifest_bytes) != manifest_len:
-        sys.exit("归档头与数据不一致（manifest 长度不符），归档可能损坏！")
-    files = parse_manifest_v1(manifest_bytes)
-    if not files:
-        print("unpack 完成: 归档为空（无文件）")
-        return str(args.output)
-    dir_mode = any("/" in rel for rel, _ in files) or len(files) > 1
-    tail_steps = len(files) if dir_mode else 1
-    total = n + tail_steps
-
-    logical = bytearray(manifest_len + meta["orig_len"])
-    logical[0:manifest_len] = manifest_bytes
-    done = 1
-    if progress:
-        progress(done, total, "解密解压")
-
-    # 第 2 步：解密其余数据块（原始下标 1..n-1）
-    def _place_data(slot, plain):
-        nonlocal done
-        orig_idx = perm[slot]
-        start = manifest_len + (orig_idx - 1) * cs
-        logical[start:start + len(plain)] = plain
-        done += 1
+    if use_parallel:
+        # 并行路径在上面已统计解密步数；此处补统计写文件尾段
+        done += len(files) if dir_mode else 1
         if progress:
-            progress(done, total, "解密解压")
+            progress(done, total, "写入文件")
 
-    data_slots = [s for s in range(n) if s != slot0]
-    try:
-        if args.jobs > 1:
-            with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key, ZSTD_LEVEL)) as pool:
-                work = [(s, entries[s], _read_payload_of(args.input, entries[s])) for s in data_slots]
-                for r in pool.imap_unordered(unpack_chunk, work):
-                    _place_data(*r)
-        else:
-            for s in data_slots:                     # 单进程：逐块懒读取
-                _place_data(*_decrypt(s))
-    except AuthError:
-        sys.exit("解密失败：加密密码错误，或归档已损坏！")
-
-    data = bytes(logical[manifest_len:])
-
-    # 第 3 步：写文件（逐文件计入进度）
     if dir_mode:
-        out_dir = Path(args.output)
-        if out_dir.exists() and not out_dir.is_dir():
-            sys.exit(f"输出路径 {args.output} 已存在且不是目录！")
-        top0 = files[0][0].split("/", 1)[0] if "/" in files[0][0] else files[0][0]
-        if out_dir.exists() and out_dir.name == top0:
-            out_dir = unique_path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        roots = {}          # 顶层文件夹 → 唯一目标目录
-        first_root = None
-        off = 0
-        for relpath, length in files:
-            if "/" in relpath:
-                top, rel = relpath.split("/", 1)
-            else:
-                top, rel = relpath, ""
-            if top not in roots:
-                root = unique_path(out_dir / top)
-                root.mkdir(parents=True, exist_ok=True)
-                roots[top] = root
-                if first_root is None:
-                    first_root = root
-            target = unique_path(roots[top] / rel) if rel else roots[top]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data[off:off + length])
-            off += length
-            done += 1
-            if progress:
-                progress(done, total, "写入文件")
-        print(f"unpack 完成: {len(files)} 个文件 → {first_root}/")
-        return str(first_root)
+        print(f"unpack 完成: {len(files)} 个文件 → {first_display}/")
     else:
-        # 单文件归档：输出为文件路径；若输出是目录则写入其中
-        if os.path.isdir(args.output) or args.output.endswith(("/", "\\")):
-            out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            target = unique_path(out_dir / files[0][0])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            done += 1
-            if progress:
-                progress(done, total, "写入文件")
-            print(f"unpack 完成: 1 个文件 → {target}（{len(data)} B）")
-            return str(target)
-        else:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            target = unique_path(Path(args.output))
-            target.write_bytes(data)
-            done += 1
-            if progress:
-                progress(done, total, "写入文件")
-            print(f"unpack 完成: 1 个文件 → {target}（{len(data)} B）")
-            return str(target)
+        print(f"unpack 完成: 1 个文件 → {first_display}（{files[0][1]} B）")
+    return str(first_display)
 
 
 # ---------------------------------------------------------------- 查看清单（无需密码）
@@ -669,8 +645,6 @@ def _unpack_v1(args, meta, enc_key, shuf_key, progress):
 def show_list(args):
     """list：读 v3 明文清单，无需密码即可查看归档内容。"""
     meta = read_archive_meta(args.input)
-    if meta["version"] == LEGACY_V1:
-        sys.exit("旧格式归档（v1）：清单已加密，无法免密查看，请用 unpack 解包。")
     with open(args.input, "rb") as f:
         f.seek(HEADER_LEN)
         manifest_bytes = f.read(meta["manifest_len"])

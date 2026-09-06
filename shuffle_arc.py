@@ -20,7 +20,12 @@ v3 changes (2026-08-16):
   * Chunk-level dedup: all files are cut into fixed-size chunks and identical chunks are stored only once;
     similar files store only their differing chunks and shared parts are not duplicated (the plaintext manifest records each file's chunk references).
   * The encrypted region contains only the "unique chunks"; the permutation is applied to unique chunks only.
-  * v1 archives can still be unpacked (their manifest is encrypted in chunk 0).
+
+v4 streaming unpack (2026-08-28):
+  * Unpack is now fully streaming: unique chunks are decrypted on demand while files are being written,
+    through an LRU block cache (bounded memory, default 256 MiB cap) instead of holding every plaintext
+    chunk in RAM. Peak memory is bounded for archives of any size.
+  * v1 legacy support has been removed entirely (LEGACY_V1 code paths deleted).
 
 Features:
   * The permutation is fully determined by the shuffle password; the header holds no permutation table —
@@ -33,7 +38,7 @@ Security notes (important):
     "weak encryption + shuffle" does not resist brute force; use strong random passwords.
   * The v3 plaintext manifest reveals file names, sizes and chunk counts (known and accepted by the user).
   * Losing either password = data is permanently unrecoverable.
-  * Custom format; no cross-version compatibility promise (v3 can unpack v1).
+  * Custom format; no cross-version compatibility promise (v3 only).
 
 Usage:
   pack   : python shuffle-arc.py pack  -i <file-or-dir> -o out.far -e passA -s passB [-c 1048576] [-I 300000] [-j 4]
@@ -60,7 +65,6 @@ from Crypto.Random import get_random_bytes
 
 MAGIC = b"SFAR1"
 VERSION = 3
-LEGACY_V1 = 1
 SALT_LEN = 16
 NONCE_LEN = 12
 TAG_LEN = 16
@@ -68,6 +72,7 @@ KEY_LEN = 32
 DEFAULT_CHUNK = 4 << 20      # 4 MiB (dedup granularity = cipher block size; benchmark: 4MB chunks are ~29% faster than 1MB)
 DEFAULT_ITER = 300_000       # PBKDF2 iteration count
 ZSTD_LEVEL = 1               # zstd compression level (benchmark: level1 is ~45% faster than level3 with almost no ratio loss; overridable via -z)
+STREAM_CACHE_BYTES = 256 << 20   # v4 streaming unpack: LRU cache cap for decrypted plaintext chunks (256 MiB)
 
 HEADER_FMT = ">5sBQIIQQ16s16s32sQ"   # magic, ver, chunk_size, n, iter, manifest_len, orig_len, salt1, salt2, perm_check, table_offset
 HEADER_LEN = struct.calcsize(HEADER_FMT)
@@ -208,28 +213,40 @@ def build_blocks(in_path: str, chunk_size: int) -> tuple:
 def parse_manifest_v3(manifest: bytes) -> list:
     """Returns [(relpath, size, refs), ...] (v3 plaintext manifest)."""
     out = []
-    for line in manifest.decode("utf-8").splitlines():
+    try:
+        text = manifest.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Corrupted archive manifest (bad encoding) — the archive may have been tampered with!") from None
+    for line in text.splitlines():
         if not line:
             continue
         try:
             size_s, rest = line.split("\t", 1)
             rel, _, refs_s = rest.partition("\t")
+            size = int(size_s)
+            if size < 0:
+                raise ValueError
             refs = [int(x) for x in refs_s.split(",") if x] if refs_s else []
-            out.append((rel, int(size_s), refs))
+            out.append((rel, size, refs))
         except (ValueError, IndexError):
             raise ValueError("Corrupted archive manifest (bad format) — the archive may have been tampered with!") from None
     return out
 
 
-def parse_manifest_v1(manifest: bytes) -> list:
-    """Returns [(relpath, length), ...] (v1 manifest, two columns only)."""
-    out = []
-    for line in manifest.decode("utf-8").splitlines():
-        if not line:
-            continue
-        length_s, _, name = line.partition("\t")
-        out.append((name, int(length_s)))
-    return out
+def _validate_relpath(relpath: str) -> str:
+    """Security: reject zip-slip / absolute / Windows-unsafe paths in the archive manifest.
+    Because the manifest is plaintext (v3), an attacker can craft malicious entries;
+    unpacking must never write outside the requested output directory.
+    Returns the normalized relpath (forward slashes, no empty/'.'/'..' segments)."""
+    if not relpath:
+        sys.exit("Unsafe path in archive manifest: empty relpath")
+    if relpath.startswith(("/", "\\")) or len(relpath) >= 2 and relpath[1] == ":":
+        sys.exit(f"Unsafe absolute path in archive manifest: {relpath!r}")
+    norm = relpath.replace("\\", "/")
+    parts = norm.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        sys.exit(f"Unsafe path traversal in archive manifest: {relpath!r}")
+    return norm
 
 
 def unique_path(path: Path) -> Path:
@@ -342,13 +359,29 @@ def pack(args, progress=None, prebuilt=None):
 
 def read_archive_meta(path: str):
     with open(path, "rb") as f:
+        f.seek(0, 2)
+        file_size = f.tell()
+        if file_size < HEADER_LEN:
+            sys.exit("Not a shuffle-arc archive file (file too small)")
+        f.seek(0)
         hdr = f.read(HEADER_LEN)
     magic, ver, chunk_size, n, iterations, manifest_len, orig_len, salt1, salt2, perm_check, table_offset = \
         struct.unpack(HEADER_FMT, hdr)
     if magic != MAGIC:
         sys.exit("Not a shuffle-arc archive file (magic mismatch)")
-    if ver not in (LEGACY_V1, VERSION):
-        sys.exit(f"Unsupported version: {ver}")
+    if ver != VERSION:
+        sys.exit(f"Unsupported version: {ver} (only v3 archives are supported)")
+    # sanity limits on attacker-controlled header fields (crafted archive → DoS / absurd allocations)
+    if n <= 0 or n > 50_000_000:
+        sys.exit(f"Unreasonable chunk count in archive header: {n}")
+    if iterations < 1000 or iterations > 50_000_000:
+        sys.exit(f"Unreasonable PBKDF2 iteration count in archive header: {iterations}")
+    if chunk_size <= 0 or chunk_size > (1 << 34):          # 16 GiB cap
+        sys.exit(f"Unreasonable chunk size in archive header: {chunk_size}")
+    if not (0 <= manifest_len <= file_size - HEADER_LEN) or orig_len > (1 << 46):  # 64 TiB cap on declared total
+        sys.exit("Archive header is inconsistent with the file size — abandoned")
+    if not (HEADER_LEN + manifest_len <= table_offset <= file_size):
+        sys.exit("Archive header table offset is out of range — abandoned")
     return dict(version=ver, chunk_size=chunk_size, n=n, iterations=iterations,
                 manifest_len=manifest_len, orig_len=orig_len,
                 salt1=salt1, salt2=salt2, perm_check=perm_check,
@@ -357,14 +390,25 @@ def read_archive_meta(path: str):
 
 def read_entries(path: str, n: int, table_offset: int) -> list:
     with open(path, "rb") as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        need = n * ENTRY_LEN
+        if table_offset + need > fsize:
+            sys.exit("Archive entry table is truncated — the archive is corrupted or tampered!")
         f.seek(table_offset)
-        raw = f.read(n * ENTRY_LEN)
+        raw = f.read(need)
     return [struct.unpack(ENTRY_FMT, raw[i:i + ENTRY_LEN]) for i in range(0, len(raw), ENTRY_LEN)]
 
 
 def _read_payload_of(path: str, entry):
     nonce, clen, olen, off = entry
+    if clen <= 0 or off < 0:
+        sys.exit("Archive entry has an invalid payload offset/length — corrupted archive!")
     with open(path, "rb") as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        if off + clen > fsize:
+            sys.exit("Archive entry points beyond the end of the file — corrupted archive!")
         f.seek(off)
         return f.read(clen)
 
@@ -382,13 +426,115 @@ def unpack(args, progress=None, precomputed=None):
     if not hmac.compare_digest(hmac.new(shuf_key, PERM_CHECK_LABEL, hashlib.sha256).digest(),
                                meta["perm_check"]):
         sys.exit("Wrong shuffle password, or the archive is corrupted!")
-    if meta["version"] == LEGACY_V1:
-        return _unpack_v1(args, meta, enc_key, shuf_key, progress)
     return _unpack_v3(args, meta, enc_key, shuf_key, progress)
 
 
+def _open_output_targets(files, out_arg):
+    """Resolve the output layout, create directories, and return (targets, first_display).
+    files: [(relpath, size, refs)]. targets: list of opened writable file handles, one per file.
+    Security: every relpath is validated (zip-slip / absolute path rejected) so unpacking
+    can never write outside the requested output directory, even against a crafted archive.
+    """
+    dir_mode = any("/" in rel for rel, _, _ in files) or len(files) > 1
+    targets = []
+    first_display = None
+    safe_files = []
+    for relpath, size, refs in files:
+        safe_files.append((_validate_relpath(relpath), size, refs))
+    files = safe_files
+    if dir_mode:
+        out_dir = Path(out_arg)
+        if out_dir.exists() and not out_dir.is_dir():
+            sys.exit(f"Output path {out_arg} exists and is not a directory!")
+        top0 = files[0][0].split("/", 1)[0] if "/" in files[0][0] else files[0][0]
+        if out_dir.exists() and out_dir.name == top0:
+            out_dir = unique_path(out_dir)
+        out_dir = out_dir.resolve()          # canonical base; all targets stay under it
+        out_dir.mkdir(parents=True, exist_ok=True)
+        roots = {}
+        for relpath, size, refs in files:
+            if "/" in relpath:
+                top, rel = relpath.split("/", 1)
+            else:
+                top, rel = relpath, ""
+            if top not in roots:
+                root = unique_path(out_dir / top)
+                root.mkdir(parents=True, exist_ok=True)
+                roots[top] = root
+                if first_display is None:
+                    first_display = root
+            target = unique_path(roots[top] / rel) if rel else roots[top]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # defense in depth: reject anything that escapes the output root (symlink/race)
+            if not (target.resolve().is_relative_to(out_dir.resolve())):
+                sys.exit(f"Unsafe output path resolved outside {out_dir}: {target}")
+            targets.append(open(target, "wb"))          # stream: handle stays open, closed by caller
+    else:
+        relpath, size, refs = files[0]
+        if os.path.isdir(out_arg) or out_arg.endswith(("/", "\\")):
+            out_dir = Path(out_arg).resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            target = unique_path(out_dir / relpath)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not (target.resolve().is_relative_to(out_dir)):
+                sys.exit(f"Unsafe output path resolved outside {out_dir}: {target}")
+        else:
+            Path(out_arg).parent.mkdir(parents=True, exist_ok=True)
+            target = unique_path(Path(out_arg))
+        targets.append(open(target, "wb"))
+        first_display = target
+    return targets, first_display, dir_mode
+
+
+class _LRUCache:
+    """Bounded-memory LRU cache of decrypted plaintext chunks, keyed by original chunk index.
+    Byte budget enforced: evicts least-recently-used entries until the new chunk fits."""
+
+    def __init__(self, budget):
+        self.budget = budget
+        self._data = {}          # ref -> bytes
+        self._order = []         # refs in recency order (back = most recent)
+        self._bytes = 0
+
+    def get(self, ref):
+        if ref not in self._data:
+            return None
+        self._order.remove(ref)
+        self._order.append(ref)
+        return self._data[ref]
+
+    def put(self, ref, chunk):
+        if ref in self._data:
+            self._order.remove(ref)
+            self._bytes -= len(self._data[ref])
+        self._data[ref] = chunk
+        self._order.append(ref)
+        self._bytes += len(chunk)
+        while self._bytes > self.budget and len(self._data) > 1:
+            old = self._order.pop(0)
+            if old in self._data:
+                self._bytes -= len(self._data.pop(old))
+
+    def __len__(self):
+        return len(self._data)
+
+
+def _decrypt_slot_entry(path, entry, slot):
+    """Read one slot's payload from the archive and decrypt+decompress it. Returns plaintext bytes."""
+    try:
+        _, plain = unpack_chunk((slot, entry, _read_payload_of(path, entry)))
+        return plain
+    except AuthError:
+        sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
+    except zstd.ZstdError:
+        sys.exit("Decompression failed: the archive is corrupted!")
+
+
 def _unpack_v3(args, meta, enc_key, shuf_key, progress):
-    """v3: plaintext manifest + unique-chunk pool + reassembly by references."""
+    """v3: plaintext manifest + unique-chunk pool + reassembly by references.
+    v4: streaming — decrypted chunks flow through a bounded LRU cache while files are written
+    chunk-by-chunk, so peak memory is capped regardless of archive size.
+    """
     n = meta["n"]                       # number of unique chunks
     manifest_len = meta["manifest_len"]
     with open(args.input, "rb") as f:
@@ -401,6 +547,11 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
     if not files:
         print("unpack done: archive is empty (no files)")
         return str(args.output)
+    # security: reject out-of-range chunk references in a crafted manifest (would crash / misassemble)
+    for relpath, size, refs in files:
+        bad = [r for r in refs if not (0 <= r < n)]
+        if bad:
+            sys.exit(f"Archive manifest references nonexistent chunk(s) {bad[:8]} — corrupted or tampered!")
     dir_mode = any("/" in rel for rel, _, _ in files) or len(files) > 1
     tail_steps = len(files) if dir_mode else 1
     total = 1 + n + tail_steps
@@ -411,15 +562,7 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
     perm = make_perm(n, shuf_key)
     inv = [0] * n
     for s, p in enumerate(perm):
-        inv[p] = s
-
-    def _decrypt(slot):
-        try:
-            return unpack_chunk((slot, entries[slot], _read_payload_of(args.input, entries[slot])))
-        except AuthError:
-            sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
-        except zstd.ZstdError:
-            sys.exit("Decompression failed: the archive is corrupted!")
+        inv[p] = s                      # original index -> storage slot
 
     if args.chunk is not None:
         # random access: original chunk N in the unique-chunk pool
@@ -427,25 +570,38 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
         if not (0 <= orig_idx < n):
             sys.exit(f"--chunk {args.chunk} out of range (unique chunk count {n})")
         slot = inv[orig_idx]
-        try:
-            _, plain = unpack_chunk((slot, entries[slot], _read_payload_of(args.input, entries[slot])))
-        except AuthError:
-            sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
-        except zstd.ZstdError:
-            sys.exit("Decompression failed: the archive is corrupted!")
+        plain = _decrypt_slot_entry(args.input, entries[slot], slot)
         out_path = f"{args.output}.chunk{args.chunk}"
         with open(out_path, "wb") as f:
             f.write(plain)
         print(f"random access: unique chunk #{args.chunk} ({len(plain)} B) extracted → {out_path}")
         return str(out_path)
 
-    # decrypt the unique-chunk pool
-    blocks = [None] * n
+    # Decide the strategy: if every unique chunk fits in the streaming budget AND parallel
+    # workers are requested, decrypt the whole pool up-front in parallel (the old fast path).
+    # Otherwise stream: decrypt on demand through the LRU cache (bounded memory, works at any size).
+    total_plain = sum(e[2] for e in entries)          # orig_len of every unique chunk
+    use_parallel = args.jobs > 1 and total_plain <= STREAM_CACHE_BYTES
+
     done = 1
     if progress:
         progress(done, total, "Decrypt & decompress")
-    try:
-        if args.jobs > 1:
+
+    cache = _LRUCache(STREAM_CACHE_BYTES)
+
+    def _block_of(ref):
+        """Plaintext bytes of original chunk `ref` (from parallel pool or LRU cache)."""
+        b = cache.get(ref)
+        if b is not None:
+            return b
+        slot = inv[ref]
+        b = _decrypt_slot_entry(args.input, entries[slot], slot)
+        cache.put(ref, b)
+        return b
+
+    if use_parallel:
+        blocks = {}
+        try:
             with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key, ZSTD_LEVEL)) as pool:
                 work = [(s, entries[s], _read_payload_of(args.input, entries[s])) for s in range(n)]
                 for slot, plain in pool.imap_unordered(unpack_chunk, work):
@@ -453,215 +609,38 @@ def _unpack_v3(args, meta, enc_key, shuf_key, progress):
                     done += 1
                     if progress:
                         progress(done, total, "Decrypt & decompress")
-        else:
-            for s in range(n):                     # single-process: lazy per-chunk reads
-                blocks[perm[s]] = _decrypt(s)[1]
+        except AuthError:
+            sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
+
+        def _block_of(ref):
+            return blocks[ref]
+
+    # stream: one file at a time, write chunk-by-chunk through the LRU cache
+    targets, first_display, dir_mode = _open_output_targets(files, args.output)
+    try:
+        for (relpath, size, refs), fh in zip(files, targets):
+            for r in refs:
+                fh.write(_block_of(r))
+            fh.flush()
+            if not use_parallel:
                 done += 1
                 if progress:
-                    progress(done, total, "Decrypt & decompress")
-    except AuthError:
-        sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
+                    progress(done, total, "Writing files")
+    finally:
+        for fh in targets:
+            fh.close()
 
-    # reassemble by references and write files
-    def _compose(refs):
-        parts = []
-        for r in refs:
-            b = blocks[r]
-            if b is None:
-                sys.exit("Archive corrupted: a chunk reference points to a nonexistent unique chunk!")
-            parts.append(b)
-        return b"".join(parts)
-
-    if dir_mode:
-        out_dir = Path(args.output)
-        if out_dir.exists() and not out_dir.is_dir():
-            sys.exit(f"Output path {args.output} exists and is not a directory!")
-        top0 = files[0][0].split("/", 1)[0] if "/" in files[0][0] else files[0][0]
-        if out_dir.exists() and out_dir.name == top0:
-            out_dir = unique_path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        roots = {}          # top-level folder → unique target directory
-        first_root = None
-        for relpath, size, refs in files:
-            if "/" in relpath:
-                top, rel = relpath.split("/", 1)
-            else:
-                top, rel = relpath, ""
-            if top not in roots:
-                root = unique_path(out_dir / top)
-                root.mkdir(parents=True, exist_ok=True)
-                roots[top] = root
-                if first_root is None:
-                    first_root = root
-            target = unique_path(roots[top] / rel) if rel else roots[top]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(_compose(refs))
-            done += 1
-            if progress:
-                progress(done, total, "Writing files")
-        print(f"unpack done: {len(files)} files → {first_root}/")
-        return str(first_root)
-    else:
-        # single-file archive: output is a file path; if the output is a directory, write into it
-        relpath, size, refs = files[0]
-        if os.path.isdir(args.output) or args.output.endswith(("/", "\\")):
-            out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            target = unique_path(out_dir / relpath)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(_compose(refs))
-            done += 1
-            if progress:
-                progress(done, total, "Writing files")
-            print(f"unpack done: 1 file → {target} ({size} B)")
-            return str(target)
-        else:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            target = unique_path(Path(args.output))
-            target.write_bytes(_compose(refs))
-            done += 1
-            if progress:
-                progress(done, total, "Writing files")
-            print(f"unpack done: 1 file → {target} ({size} B)")
-            return str(target)
-
-
-def _unpack_v1(args, meta, enc_key, shuf_key, progress):
-    """v1 legacy archive: the manifest is the encrypted chunk 0; data chunks start at 1."""
-    n = meta["n"]
-    cs = meta["chunk_size"]
-    manifest_len = meta["manifest_len"]
-    entries = read_entries(args.input, n, meta["table_offset"])
-    global KEY
-    KEY = enc_key   # --chunk branch decrypts directly in the main process; full branch injects via the worker initializer
-    perm = make_perm(n, shuf_key)
-    inv = [0] * n
-    for s, p in enumerate(perm):
-        inv[p] = s
-
-    if args.chunk is not None:
-        # chunk 0 is the manifest; --chunk i maps to data chunk i (original index i+1)
-        orig_idx = args.chunk + 1
-        if not (0 <= orig_idx < n):
-            sys.exit(f"--chunk {args.chunk} out of range (data chunk count {n - 1})")
-        slot = inv[orig_idx]
-        payload = _read_payload_of(args.input, entries[slot])
-        try:
-            slot_back, plain = unpack_chunk((slot, entries[slot], payload))
-        except AuthError:
-            sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
-        out_path = f"{args.output}.chunk{args.chunk}"
-        with open(out_path, "wb") as f:
-            f.write(plain)
-        print(f"random access: original chunk {args.chunk} ({len(plain)} B) extracted → {out_path}")
-        return str(out_path)
-
-    def _decrypt(slot):
-        try:
-            return unpack_chunk((slot, entries[slot], _read_payload_of(args.input, entries[slot])))
-        except AuthError:
-            sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
-        except zstd.ZstdError:
-            sys.exit("Decompression failed: the archive is corrupted!")
-
-    # step 1: decrypt the manifest (chunk 0) to determine the file count and total progress steps
-    slot0 = inv[0]
-    _, manifest_bytes = _decrypt(slot0)
-    if len(manifest_bytes) != manifest_len:
-        sys.exit("Archive header and data are inconsistent (manifest length mismatch); the archive may be corrupted!")
-    files = parse_manifest_v1(manifest_bytes)
-    if not files:
-        print("unpack done: archive is empty (no files)")
-        return str(args.output)
-    dir_mode = any("/" in rel for rel, _ in files) or len(files) > 1
-    tail_steps = len(files) if dir_mode else 1
-    total = n + tail_steps
-
-    logical = bytearray(manifest_len + meta["orig_len"])
-    logical[0:manifest_len] = manifest_bytes
-    done = 1
-    if progress:
-        progress(done, total, "Decrypt & decompress")
-
-    # step 2: decrypt the remaining data chunks (original indices 1..n-1)
-    def _place_data(slot, plain):
-        nonlocal done
-        orig_idx = perm[slot]
-        start = manifest_len + (orig_idx - 1) * cs
-        logical[start:start + len(plain)] = plain
-        done += 1
+    if use_parallel:
+        # parallel path counted decryption steps above; count the file-writing tail now
+        done += len(files) if dir_mode else 1
         if progress:
-            progress(done, total, "Decrypt & decompress")
+            progress(done, total, "Writing files")
 
-    data_slots = [s for s in range(n) if s != slot0]
-    try:
-        if args.jobs > 1:
-            with Pool(args.jobs, initializer=_init_worker, initargs=(enc_key, ZSTD_LEVEL)) as pool:
-                work = [(s, entries[s], _read_payload_of(args.input, entries[s])) for s in data_slots]
-                for r in pool.imap_unordered(unpack_chunk, work):
-                    _place_data(*r)
-        else:
-            for s in data_slots:                     # single-process: lazy per-chunk reads
-                _place_data(*_decrypt(s))
-    except AuthError:
-        sys.exit("Decryption failed: wrong encryption password, or the archive is corrupted!")
-
-    data = bytes(logical[manifest_len:])
-
-    # step 3: write files (count each file into progress)
     if dir_mode:
-        out_dir = Path(args.output)
-        if out_dir.exists() and not out_dir.is_dir():
-            sys.exit(f"Output path {args.output} exists and is not a directory!")
-        top0 = files[0][0].split("/", 1)[0] if "/" in files[0][0] else files[0][0]
-        if out_dir.exists() and out_dir.name == top0:
-            out_dir = unique_path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        roots = {}          # top-level folder → unique target directory
-        first_root = None
-        off = 0
-        for relpath, length in files:
-            if "/" in relpath:
-                top, rel = relpath.split("/", 1)
-            else:
-                top, rel = relpath, ""
-            if top not in roots:
-                root = unique_path(out_dir / top)
-                root.mkdir(parents=True, exist_ok=True)
-                roots[top] = root
-                if first_root is None:
-                    first_root = root
-            target = unique_path(roots[top] / rel) if rel else roots[top]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data[off:off + length])
-            off += length
-            done += 1
-            if progress:
-                progress(done, total, "Writing files")
-        print(f"unpack done: {len(files)} files → {first_root}/")
-        return str(first_root)
+        print(f"unpack done: {len(files)} files → {first_display}/")
     else:
-        # single-file archive: output is a file path; if the output is a directory, write into it
-        if os.path.isdir(args.output) or args.output.endswith(("/", "\\")):
-            out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            target = unique_path(out_dir / files[0][0])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            done += 1
-            if progress:
-                progress(done, total, "Writing files")
-            print(f"unpack done: 1 file → {target} ({len(data)} B)")
-            return str(target)
-        else:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            target = unique_path(Path(args.output))
-            target.write_bytes(data)
-            done += 1
-            if progress:
-                progress(done, total, "Writing files")
-            print(f"unpack done: 1 file → {target} ({len(data)} B)")
-            return str(target)
+        print(f"unpack done: 1 file → {first_display} ({files[0][1]} B)")
+    return str(first_display)
 
 
 # ---------------------------------------------------------------- view manifest (no password needed)
@@ -669,8 +648,6 @@ def _unpack_v1(args, meta, enc_key, shuf_key, progress):
 def show_list(args):
     """list: read the v3 plaintext manifest; view archive contents without a password."""
     meta = read_archive_meta(args.input)
-    if meta["version"] == LEGACY_V1:
-        sys.exit("Legacy v1 archive: the manifest is encrypted and cannot be listed without a password; use unpack instead.")
     with open(args.input, "rb") as f:
         f.seek(HEADER_LEN)
         manifest_bytes = f.read(meta["manifest_len"])

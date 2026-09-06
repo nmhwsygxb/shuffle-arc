@@ -1,259 +1,404 @@
-<div align="center">
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Platform-Windows%20|%20Linux%20|%20macOS-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Android-green" alt="Android">
+  <img src="https://img.shields.io/badge/License-MIT-blue" alt="License">
+  <img src="https://img.shields.io/badge/Encryption-AES--256--GCM-green" alt="Encryption">
+  <img src="https://img.shields.io/badge/Compression-zstd-brightgreen" alt="Compression">
+  <img src="https://img.shields.io/badge/Release-v4.0.0-blueviolet" alt="Release">
+</p>
 
-# 🔀 shuffle-arc
+<h1 align="center">🔀 shuffle-arc</h1>
 
-**双密码「分块打乱加密压缩」归档工具** · **Dual-password chunked shuffle-encrypt archive tool**
+<p align="center">
+  <b>双密码加密归档工具</b> — 加密保内容 · 打乱保顺序 · 三倍快于 7z<br>
+  <i>Two-password encrypted archiver: content protection + order secrecy + 3× faster than 7z</i>
+</p>
 
-先压缩加密，再把密文块按「打乱密码」派生的置换乱序写入归档——即使归档和加密密码同时泄露，攻击者也看不出内容的原始顺序。
+<p align="center">
+  <a href="#zh">📖 中文版</a> · <a href="#en">📖 English</a>
+</p>
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue)
-![Python](https://img.shields.io/badge/python-3.9%2B-3776AB)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-![Release](https://img.shields.io/badge/release-v3.0.0-blueviolet)
-![Zero deps](https://img.shields.io/badge/zip%2B7z%20alternative-✓-brightgreen)
-
-**🇨🇳 [中文](#-中文) · 🇬🇧 [English](#-english)**
-
-</div>
+<br>
 
 ---
 
 <a id="zh"></a>
-# 🇨🇳 中文
 
-## 💡 它解决什么问题？
+<br>
 
-普通压缩工具（zip / 7z）即使加了密码，归档内部的结构也一览无余：**哪个文件大、有多少块、内容排列顺序**全都暴露。shuffle-arc 更进一步——它把密文块按第二个密码派生的置换**打乱顺序**再写入归档：
+<h2 align="center">📖 中文版</h2>
+
+<br>
+
+## 💡 为什么需要双密码？
+
+传统加密压缩只有一个密码，拿到密码的人能看到**所有信息**——文件数量、文件名、大小、原始顺序。
 
 ```
-文件/目录 → 切块 → 逐块 zstd 压缩 → 逐块 AES-256-GCM 加密 → 按打乱密码置换乱序写入
+┌────────────────────────────────────────────┐
+│  7z / RAR：单一密码 → 全部可见              │
+│  拿到密码 = 知道文件名叫什么、多少文件、顺序  │
+└────────────────────────────────────────────┘
 ```
 
-> 🛡️ **两个完全独立的密码**
-> - **加密密码 `-e`**：保护内容
-> - **打乱密码 `-s`**：保护顺序（置换不入档，完全由密码派生）
->
-> ⚠️ **安全提醒**：打乱保护的是【顺序】，不是【内容】。两个密码都必须足够强，「弱加密 + 打乱」并不能防暴力破解。**忘记任意一个密码 = 数据永久不可恢复。**
+**shuffle-arc 不一样：** 两个独立密码，各管各的。
 
-## ✨ 特性
+```
+┌────────────────────────────────────────────┐
+│  加密密码 → 保护文件内容（AES-256-GCM）      │
+│  打乱密码 → 保护文件顺序（Fisher-Yates 置换） │
+│  两者缺一不可，置换不入档，不解              │
+└────────────────────────────────────────────┘
+```
 
-| 🚀 特性 | 说明 |
-|---|---|
-| 🔑 **双密码** | `-e` 加密密码 + `-s` 打乱密码，独立派生两把密钥（PBKDF2-HMAC-SHA256，默认 300k 迭代） |
-| 🔒 **强加密** | 每块独立 AES-256-GCM（随机 nonce，AAD 绑定存储槽位，防调包 / 换序） |
-| 🗜️ **快速压缩** | 每块独立 zstd（默认 level 1，打包速度约为 7z LZMA2 的 **3 倍**） |
-| 🎲 **顺序打乱** | Fisher-Yates + HMAC-SHA256 伪随机置换，置换**不入档**，完全由打乱密码决定 |
-| ♻️ **分块去重** | 按块 sha256 去重：相同块只存一份，相似文件只存差异块 |
-| 📋 **明文清单** | v3 起清单明文存储，`list` 命令**无需密码**即可查看归档内文件 |
-| ⚡ **随机访问** | `unpack --chunk N` 只解出唯一块池中的第 N 块 |
-| 🕰️ **向后兼容** | 可解 v1 旧档（旧档清单加密于第 0 块） |
-| 🛡️ **防覆盖** | 输出文件已存在时自动改名 `name (1).far`，绝不静默覆盖 |
+> 即使归档和加密密码同时泄露，攻击者也**看不出数据的原始排列**——顺序由独立的打乱密码保护，而这个密码不在文件里。
+
+<br>
+
+## ✨ 特性一览
+
+| | 特性 | 说明 |
+|:-:|---|---|
+| 🔑 | **双密码** | `-e` 加密 + `-s` 打乱，独立派生（PBKDF2-HMAC-SHA256，300k 迭代） |
+| 🔒 | **AES-256-GCM** | 每块独立加密，随机 nonce，AAD 绑定存储槽位，防调包换序 |
+| 🔀 | **分块打乱** | Fisher-Yates + HMAC-SHA256，置换不入档，完全由打乱密码决定 |
+| 📦 | **zstd 压缩** | 每块独立 zstd，默认 level 1，可用 `-z` 调整 |
+| 🗑️ | **块级去重** | 相同块 sha256 去重，只存一份；相似文件只存差异块 |
+| 📋 | **明文清单** | `list` 命令无需密码即可查看归档内容 |
+| 🎯 | **随机访问** | `unpack --chunk N` 只解出唯一块池中第 N 块 |
+| ⚡ | **3 倍快于 7z** | 实测打包 150 MB/s，vs 7z 的 46 MB/s |
+
+<br>
+
+## 📊 性能对比
+
+> 实测 3.1 GB 数据（Unity 素材，含不可压缩文件）
+
+| 维度 | 🚀 shuffle-arc | 📦 7z (LZMA2 -mx=1) |
+|:---|---:|---:|
+| **打包** | **20.7 s** (150 MB/s) | 67.8 s (46 MB/s) |
+| 解压 | 41.8 s (74 MB/s) | **36.1 s** (86 MB/s) |
+| 压缩比 | 56.7% | **49.5%** |
+
+**定位：** 打包快 3 倍（zstd level 1），压缩比略逊 LZMA2。解压 7z 略快（shuffle-arc 多付出 AES 解密 + 认证 + 置换还原）。
+
+> 7z 没有「打乱保护顺序 + 免密清单 + 分块去重」——**不同工具，解决不同问题。**
+
+<br>
 
 ## 🚀 快速开始
 
-### 方式一：免安装（Windows）
+### 免安装（Windows exe）
 
 从 [Releases](https://github.com/nmhwsygxb/shuffle-arc/releases) 下载：
 
-| 文件 | 用途 |
+| 文件 | 说明 |
 |---|---|
-| `shuffle-arc-gui.exe` / `shuffle-arc-gui-zh.exe` | 🖥️ GUI 面板（双击即用，中/英） |
-| `shuffle-arc-cli.exe` / `shuffle-arc-cli-zh.exe` | ⌨️ 命令行（中/英） |
-| `shuffle-arc-v3.zip` | 📦 全家桶：exe + 源码 + README |
+| `shuffle-arc-gui.exe` | 🖥️ GUI 面板（英文），双击即用 |
+| `shuffle-arc-gui-zh.exe` | 🖥️ GUI 面板（中文） |
+| `shuffle-arc-cli.exe` | ⌨️ 命令行（英文） |
+| `shuffle-arc-cli-zh.exe` | ⌨️ 命令行（中文） |
+| `shuffle-arc-android-debug.apk` | 📱 Android 应用（Kotlin 原生，minSdk 24） |
 
-### 方式二：从源码运行
-
-```bash
-pip install -r requirements.txt    # zstandard, pycryptodome
-python shuffle_arc.py --help        # 或 python shuffle_arc_gui.py 打开图形界面
-```
-
-需要 Python **3.9+**（Windows 下用 `py -3.14` 亦可）。
-
-## 📖 使用指南
-
-### CLI 打包 / 解包 / 查看
+### 从源码运行
 
 ```bash
-# 📦 打包（文件或目录 → .far 归档）
-python shuffle_arc.py pack -i <文件或目录> -o out.far -e 加密密码 -s 打乱密码
-
-# 📂 解包（单文件归档 -o 为文件路径；多文件 -o 为输出目录）
-python shuffle_arc.py unpack -i out.far -o <输出> -e 加密密码 -s 打乱密码
-
-# 📋 查看归档清单（无需密码，v3 明文清单）
-python shuffle_arc.py list -i out.far
-
-# ⚡ 随机访问：只解出唯一块池中的原始第 N 块
-python shuffle_arc.py unpack -i out.far -o <输出> -e ... -s ... --chunk 3
-```
-
-**参数一览：**
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `-c, --chunk-size` | 4 MiB | 块大小 = 去重粒度 = 加密块大小 |
-| `-z, --zstd-level` | 1 | zstd 压缩级别（越大压缩比越高、越慢） |
-| `-I, --iter` | 300000 | PBKDF2 迭代次数 |
-| `-j, --jobs` | CPU 数 | 并行进程数 |
-
-> 💡 密码不传则交互输入（`input()` 明文回显；getpass 在冻结 exe 中不可用）。**两个密码必须不同。**
-
-### 🖥️ GUI 面板
-
-`shuffle-arc-gui.exe` 三步完成：**选文件 → 设双密码 → 进度条**。
-
-不带参数启动（含双击 exe）会进入交互向导：`1=打包 2=解包 3=查看清单 q=退出`。
-
-## ⚙️ 工作原理（归档格式 v3）
-
-```
-┌─ 头部（明文，固定长度）────────────────────────────┐
-│ magic "SFAR1" · version=3 · chunk_size · n(唯一块数)  │
-│ iterations · manifest_len · orig_len · salt1 · salt2 │
-│ perm_check(HMAC) · table_offset                       │
-├─ 明文清单（manifest）───────────────────────────────┤
-│ 每行: {size}\t{relpath}\t{ref0},{ref1},...            │
-├─ 加密区：唯一块池（按打乱置换乱序写入）────────────────┤
-│ 每块: zstd 压缩 → AES-256-GCM（AAD 绑定槽位）          │
-└─ 条目表：nonce / cipher_len / orig_len / payload_offset ┘
-```
-
-- 置换（`perm`）完全由打乱密码派生，**不入档**；`perm[slot]` = 存储于该槽位的原始块下标
-- v1 旧档：manifest 为加密的第 0 块（`unpack` 自动识别版本）
-
-## 📊 性能对比（3.1 GB 数据实测）
-
-| 维度 | shuffle-arc | 7z (LZMA2 -mx=1) |
-|---|---|---|
-| 压缩 | **20.7s（150 MB/s）** 🏆 | 67.8s（46 MB/s） |
-| 解压 | 41.8s（74 MB/s） | **36.1s（86 MB/s）** 🏆 |
-| 压缩比 | 56.7% | **49.5%** 🏆 |
-
-**定位**：主打**压缩快 3 倍**（zstd level 1），压缩比略逊 LZMA2（设计取舍，可用 `-z` 调高级别）。解压 7z 略快（shuffle-arc 多付出 AES 解密 + 认证 + 置换还原）。功能上 7z 没有「打乱保护顺序 + 免密清单 + 分块去重」。
-
-## 🛠️ 开发 & 构建
-
-```bash
-# GUI（windowed，无控制台窗口）
-py -3.14 -m PyInstaller --onefile --noconsole --name shuffle-arc-gui shuffle_arc_gui.py
-# CLI（console）
-py -3.14 -m PyInstaller --onefile --name shuffle-arc-cli shuffle_arc.py
-```
-
-## 🧪 测试
-
-```bash
-python _test_v3.py        # v3 功能：去重 / 还原 / list / 随机访问 / 错误密码
-python _test_v1_gui.py    # v1 兼容 + GUI prebuilt 路径
-python _bench.py          # 性能基准（D 盘临时目录，结束自动清理）
-```
-
-## ⚠️ 已知限制
-
-- 自定义格式，无跨版本兼容承诺（v3 可解 v1；将来新版本会保留向后兼容）
-- 清单明文会泄露文件名 / 大小 / 块数（为免密 list 做的权衡，用户已知并接受）
-- 大文件全量读入内存（打包 / 解包峰值内存 ≈ 源数据大小）
-- 打乱保护顺序不保护内容——请使用强随机密码
-
-## 📄 License
-
-[MIT](LICENSE) © 2026 nmhwsygxb
-
----
-
-<a id="en"></a>
-# 🇬🇧 English
-
-A CLI/GUI archiver that compresses and encrypts files, then **shuffles the ciphertext blocks** using a permutation derived from a second, independent password.
-
-```
-files/dir → split into chunks → zstd-compress each → AES-256-GCM encrypt each → write in permuted order
-```
-
-Even if someone gets the archive *and* the encryption password, they cannot reconstruct the original data order — the order is protected by the separate shuffle password. **The permutation is never stored; it is derived from the shuffle password every time.**
-
-**Two independent passwords, always different:**
-- **encryption password** (`-e`) — protects content
-- **shuffle password** (`-s`) — protects order
-
-> ⚠️ **Warning:** shuffling protects *order*, not *content*. Both passwords must be strong. Forgetting either password means permanent data loss.
-
-## What makes it different
-
-| | shuffle-arc | 7z / zip |
-|---|---|---|
-| Encryption | AES-256-GCM per chunk | ✅ |
-| Order protection | keyed permutation, **never stored** | ❌ |
-| Dedup | identical chunks stored once | ❌ |
-| Password-free listing | plaintext manifest, `list` | depends |
-| Random access | `unpack --chunk N` | partial |
-
-It is not a 7z replacement. It is for the case where the *layout of the data inside the archive* must stay secret too — which files are big, how many chunks, or that a "file" is actually a stream of repeated blocks.
-
-## Quick start
-
-**Windows (no install):** grab the GUI/CLI exe from the [Releases](https://github.com/nmhwsygxb/shuffle-arc/releases) page.
-
-**From source (Python 3.9+):**
-
-```bash
-pip install -r requirements.txt    # zstandard, pycryptodome
+pip install -r requirements.txt
 python shuffle_arc.py --help
 ```
 
-## Usage
+> 需要 Python 3.9+。GUI 版：`python shuffle_arc_gui.py`
+
+### 语言版本
+
+| 语言 | 脚本 | exe |
+|:---|---:|---:|
+| 🇬🇧 English | `shuffle_arc.py` / `shuffle_arc_gui.py` | `shuffle-arc-gui.exe` / `shuffle-arc-cli.exe` |
+| 🇨🇳 中文 | `shuffle_arc_zh.py` / `shuffle_arc_gui_zh.py` | `shuffle-arc-gui-zh.exe` / `shuffle-arc-cli-zh.exe` |
+
+<br>
+
+## ⌨️ 用法
+
+### CLI 命令
 
 ```bash
-# pack a file or directory
-python shuffle_arc.py pack -i <path> -o out.far -e encpassword -s shuffpass
+# 打包
+python shuffle_arc.py pack -i <文件/目录> -o out.far -e 加密密码 -s 打乱密码
 
-# unpack (single-file archive: -o is a file; multi-file: -o is a directory)
-python shuffle_arc.py unpack -i out.far -o <out> -e encpassword -s shuffpass
+# 解包
+python shuffle_arc.py unpack -i out.far -o <输出> -e 加密密码 -s 打乱密码
 
-# list archive contents — no password needed (v3 plaintext manifest)
+# 查看清单（无需密码）
 python shuffle_arc.py list -i out.far
 
-# random access: decrypt only chunk N of the unique block pool
-python shuffle_arc.py unpack -i out.far -o <out> -e ... -s ... --chunk 3
+# 随机访问
+python shuffle_arc.py unpack -i out.far --chunk 3 -e ... -s ... -o <输出>
 ```
 
-| Option | Default | Meaning |
-|---|---|---|
+### 参数
+
+| 参数 | 默认 | 说明 |
+|:---|---:|---|
+| `-c, --chunk-size` | 4 MiB | 块大小 = 去重粒度 = 加密块大小 |
+| `-z, --zstd-level` | 1 | 压缩级别（越大越慢，压缩比越高） |
+| `-I, --iter` | 300000 | PBKDF2 迭代次数 |
+| `-j, --jobs` | CPU 数 | 并行进程数 |
+
+> 密码不传则交互输入。两个密码**必须不同**。不带参数启动进入交互向导。
+
+<br>
+
+## 🏗️ 归档格式（v3）
+
+```
+ ┌─────────────────────────────────────────────────┐
+ │ 头部（明文，固定长度）                            │
+ │ magic "SFAR1" · version=3 · chunk_size · n      │
+ │ iterations · manifest_len · orig_len · salt1/2  │
+ │ perm_check(HMAC) · table_offset                  │
+ ├─────────────────────────────────────────────────┤
+ │ 明文清单（manifest）                              │
+ │ 每行: {size}\t{relpath}\t{ref0},{ref1},...       │
+ ├─────────────────────────────────────────────────┤
+ │ 加密区：唯一块池（按打乱置换乱序写入）              │
+ │ 每块: zstd → AES-256-GCM（AAD 绑定槽位）          │
+ ├─────────────────────────────────────────────────┤
+ │ 条目表: nonce / cipher_len / orig_len / offset   │
+ └─────────────────────────────────────────────────┘
+```
+
+- 置换（`perm`）完全由打乱密码派生，**不入档**
+- 仅支持 v3 归档（v1 旧档支持已移除）
+
+<br>
+
+## 🔧 构建 & 测试
+
+```bash
+# 构建 exe
+pyinstaller --onefile --noconsole --name shuffle-arc-gui shuffle_arc_gui.py
+pyinstaller --onefile --name shuffle-arc-cli shuffle_arc.py
+
+# 测试
+python _test_v3.py        # 核心功能测试
+python _test_v4_stream.py  # 流式解包 + v1 移除回归测试
+python _bench.py          # 性能基准
+```
+
+<br>
+
+## ⚠️ 注意事项
+
+- 自定义格式，仅支持 v3（v1 旧档支持已移除）
+- 清单明文会泄露文件名/大小/块数——有意为之，换来免密查看
+- 解包已流式化（LRU 缓存，内存封顶）；打包仍全量读入内存，峰值 ≈ 源数据大小
+- **打乱保顺序，不保内容**——两个密码都必须足够强
+- **忘记任意一个密码 = 数据永久不可恢复**
+
+## 🛡️ 安全加固（2026-09-05）
+
+针对「恶意构造的归档」做了解包侧防御（清单是明文，攻击者可伪造条目）：
+
+- **路径穿越（Zip Slip）已封堵**：清单里的文件名/目录若含 `..`、绝对路径或
+  Windows 盘符（`C:`），解包直接拒绝——绝不会写出输出目录之外。
+  并做二次防御：解析后的每个目标路径都校验仍在输出根目录内。
+- **头字段 DoS 已封堵**：`read_archive_meta` 对归档头里攻击者可控的字段
+  （块数、PBKDF2 迭代次数、块大小、清单长度、条目表偏移）做合理性上限校验，
+  恶意归档无法再让解包者陷入天文数字的 PBKDF2 循环或超大内存分配。
+- **越界块引用已拒绝**：清单引用不存在的唯一块时立即报错而非崩溃/错乱。
+- **条目表不完整 / 载荷越界已拒绝**：截断或指向文件末尾之外的条目直接报错。
+- **错误密码一律拒绝**：GCM 认证失败、乱序校验失败均优雅退出。
+
+提示：v3 清单明文是设计取舍（免密 `list`）；若未来需要隐藏文件名/防篡改，
+需引入认证保护与加密清单（格式将升级，勿混用版本）。
+
+---
+
+<br>
+
+<a id="en"></a>
+
+<h2 align="center">📖 English</h2>
+
+<br>
+
+## 💡 Why Two Passwords?
+
+Traditional archives use a single password — anyone who has it sees **everything**: file names, counts, sizes, and the original order.
+
+**shuffle-arc's approach:** two independent passwords, each with its own job.
+
+```
+┌────────────────────────────────────────────┐
+│  Encryption password → protects content    │
+│  Shuffle password    → protects order      │
+│  Both required. Permutation never stored.  │
+└────────────────────────────────────────────┘
+```
+
+Even if someone gets the archive *and* the encryption password, they can't reconstruct the original layout.
+
+<br>
+
+## ✨ Features
+
+| | Feature | Description |
+|:-:|---|---|
+| 🔑 | **Dual passwords** | `-e` encryption + `-s` shuffle, independent key derivation (PBKDF2-HMAC-SHA256, 300k iterations) |
+| 🔒 | **AES-256-GCM** | Per-chunk encryption, random nonce, AAD binds slot position |
+| 🔀 | **Chunk shuffling** | Fisher-Yates + HMAC-SHA256, never stored on disk |
+| 📦 | **zstd compression** | Per-chunk zstd, level adjustable via `-z` |
+| 🗑️ | **Block-level dedup** | Identical chunks stored once via sha256 |
+| 📋 | **Plaintext manifest** | `list` command shows contents without a password |
+| 🎯 | **Random access** | `unpack --chunk N` decrypts only the N-th chunk |
+| ⚡ | **3× faster than 7z** | ~150 MB/s pack speed vs 7z's 46 MB/s |
+
+<br>
+
+## 📊 Performance
+
+> 3.1 GB real-world data (Unity assets, partially incompressible)
+
+| Metric | 🚀 shuffle-arc | 📦 7z (LZMA2 -mx=1) |
+|:---|---:|---:|
+| **Pack** | **20.7 s** (150 MB/s) | 67.8 s (46 MB/s) |
+| Unpack | 41.8 s (74 MB/s) | **36.1 s** (86 MB/s) |
+| Ratio | 56.7% | **49.5%** |
+
+> 7z can't do order protection, password-free listing, or block-level dedup — **different tools, different jobs.**
+
+<br>
+
+## 🚀 Quick Start
+
+### Windows exe
+
+Download from [Releases](https://github.com/nmhwsygxb/shuffle-arc/releases):
+
+| File | Description |
+|---|---|
+| `shuffle-arc.exe` | 🖥️ GUI launcher |
+| `shuffle-arc-cli.exe` | ⌨️ CLI (English) |
+| `shuffle-arc-cli-zh.exe` | ⌨️ CLI (中文) |
+
+### From source
+
+```bash
+pip install -r requirements.txt
+python shuffle_arc.py --help
+```
+
+> Requires Python 3.9+. GUI: `python shuffle_arc_gui.py`
+
+### Language variants
+
+| Variant | Script | exe |
+|:---|---:|---:|
+| 🇬🇧 English | `shuffle_arc.py` / `shuffle_arc_gui.py` | `shuffle-arc-gui.exe` / `shuffle-arc-cli.exe` |
+| 🇨🇳 中文 | `shuffle_arc_zh.py` / `shuffle_arc_gui_zh.py` | `shuffle-arc-gui-zh.exe` / `shuffle-arc-cli-zh.exe` |
+
+<br>
+
+## ⌨️ Usage
+
+```bash
+# pack
+python shuffle_arc.py pack -i <path> -o out.far -e encpassword -s shuffpass
+
+# unpack
+python shuffle_arc.py unpack -i out.far -o <out> -e encpassword -s shuffpass
+
+# list (no password needed)
+python shuffle_arc.py list -i out.far
+
+# random access
+python shuffle_arc.py unpack -i out.far --chunk 3 -e ... -s ... -o <out>
+```
+
+### Options
+
+| Option | Default | Description |
+|:---|---:|---|
 | `-c, --chunk-size` | 4 MiB | chunk size = dedup granularity = encryption block |
-| `-z, --zstd-level` | 1 | zstd level (higher = smaller but slower) |
+| `-z, --zstd-level` | 1 | zstd compression level |
 | `-I, --iter` | 300000 | PBKDF2 iterations |
 | `-j, --jobs` | CPU count | parallel processes |
 
-Run with **no arguments** for the interactive wizard (`1=pack 2=unpack 3=list`). The GUI is a single window: pick source → set the two passwords → progress bar.
+> Passwords are prompted if omitted. The two passwords **must be different**. Run with no arguments for the interactive wizard.
 
-## Performance (3.1 GB measured)
+<br>
 
-| | shuffle-arc | 7z (LZMA2, -mx=1) |
-|---|---|---|
-| pack | **20.7 s** (150 MB/s) 🏆 | 67.8 s (46 MB/s) |
-| unpack | 41.8 s (74 MB/s) | **36.1 s** (86 MB/s) 🏆 |
-| size | 56.7% | **49.5%** 🏆 |
+## 🏗️ Archive Format (v3)
 
-Packing is ~3× faster than 7z at default zstd level 1; 7z compresses somewhat better (LZMA2). Raise `-z` for a better ratio.
-
-## Build & test
-
-```bash
-py -3.14 -m PyInstaller --onefile --noconsole --name shuffle-arc-gui shuffle_arc_gui.py
-py -3.14 -m PyInstaller --onefile --name shuffle-arc-cli shuffle_arc.py
-
-python _test_v3.py        # dedup / round-trip / list / random access / wrong password
-python _test_v1_gui.py    # v1 compat + GUI prebuilt path
+```
+ ┌─────────────────────────────────────────────────┐
+ │ header (plaintext, fixed length)                  │
+ │ magic "SFAR1", version=3, chunk_size, n, ...      │
+ │ iterations, manifest_len, orig_len, salt1, salt2  │
+ │ perm_check(HMAC), table_offset                    │
+ ├─────────────────────────────────────────────────┤
+ │ plaintext manifest                                │
+ │   {size}\t{relpath}\t{ref0},{ref1},...           │
+ ├─────────────────────────────────────────────────┤
+ │ encrypted unique-chunk pool (permuted order)      │
+ │   each chunk: zstd → AES-256-GCM                 │
+ ├─────────────────────────────────────────────────┤
+ │ entry table: nonce / cipher_len / orig_len / off  │
+ └─────────────────────────────────────────────────┘
 ```
 
-## Limitations
+- Permutation is derived from the shuffle password — **never stored**
+- v3 only (v1 legacy support removed)
 
-- Custom format; no forward-compatibility promise (v3 reads v1; future versions will keep reading old ones).
-- The plaintext manifest leaks filenames / sizes / chunk counts (deliberate trade-off for password-free listing).
-- Files are read fully into memory; peak memory ≈ source size.
-- Use strong random passwords. Order protection ≠ content protection.
+<br>
 
-## License
+## 🔧 Build & Test
 
-[MIT](LICENSE) © 2026 nmhwsygxb
+```bash
+pyinstaller --onefile --noconsole --name shuffle-arc-gui shuffle_arc_gui.py
+pyinstaller --onefile --name shuffle-arc-cli shuffle_arc.py
+
+python _test_v3.py        # core functionality tests
+python _test_v4_stream.py  # streaming unpack + v1-removal regression
+python _bench.py          # performance benchmark
+```
+
+<br>
+
+## ⚠️ Notes
+
+- Custom format; v3 only (v1 legacy support removed)
+- Plaintext manifest leaks filenames/sizes/chunk counts (trade-off for password-free listing)
+- Unpack is streaming (LRU cache, bounded memory); pack still reads fully into memory, peak ≈ source size
+- **Shuffle protects order, not content** — use strong random passwords
+- **Forgetting either password = permanent data loss**
+
+## 🛡️ Security Hardening (2026-09-05)
+
+Defenses on the unpack side against crafted archives (the manifest is plaintext, so entries can be forged):
+
+- **Zip-slip blocked**: filenames/directories in the manifest containing `..`, absolute
+  paths, or Windows drive letters (`C:`) are rejected outright — extraction can never
+  write outside the requested output directory. Defense-in-depth: every resolved target
+  is verified to stay under the canonical output root.
+- **Header-field DoS blocked**: `read_archive_meta` sanity-limits attacker-controlled
+  header fields (chunk count, PBKDF2 iterations, chunk size, manifest length, table
+  offset), so a crafted archive cannot force absurd KDF loops or huge allocations.
+- **Out-of-range chunk refs rejected**: manifest references to nonexistent unique chunks
+  fail fast instead of crashing/misassembling.
+- **Truncated entry table / out-of-bounds payload rejected**.
+- **Wrong passwords always fail**: GCM auth and permutation checks exit cleanly.
+
+Note: the plaintext v3 manifest is an intentional design trade-off (password-free
+`list`); hiding filenames or adding tamper-resistance requires an authenticated,
+encrypted manifest — a format upgrade that will not interoperate with v3.
+
+---
+
+<br>
+
+<p align="center">
+  <sub>Made with ❤️ by one person who thinks encryption should do more than just hide content</sub>
+</p>
